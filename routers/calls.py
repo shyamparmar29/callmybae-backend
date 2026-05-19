@@ -79,6 +79,7 @@ async def initiate_call(
         "is_free": session.is_free_call and phone not in BYPASS_NUMBERS,
         "opener": None,
         "call_uuid": None,
+        "ai_speaking": False,   # mute Deepgram while AI speaks
     }
     audio_counter[session.id] = 0
 
@@ -109,13 +110,26 @@ async def serve_audio(session_id: str, index: int):
     return Response(content=audio, media_type="audio/mpeg")
 
 
-async def play_on_call(session_id: str, call_uuid: str, text: str, voice_id: str):
+async def stop_current_audio(call_uuid: str):
+    """Stop any currently playing audio before starting new one."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.delete(
+                f"https://api.plivo.com/v1/Account/{settings.PLIVO_AUTH_ID}/Call/{call_uuid}/Play/",
+                auth=(settings.PLIVO_AUTH_ID, settings.PLIVO_AUTH_TOKEN),
+            )
+    except Exception:
+        pass  # Ignore — it's fine if nothing was playing
+
+
+async def play_on_call(session_id: str, call_uuid: str, text: str, voice_id: str, call_state: dict) -> float:
     """
-    Generate ElevenLabs audio, cache it, inject into live call
-    via Plivo REST API using async httpx (not blocking SDK).
+    Generate audio, stop current playback, inject new audio.
+    Returns estimated duration in seconds so caller can wait.
     """
     try:
-        logger.info(f"TTS generating: '{text[:80]}'")
+        call_state["ai_speaking"] = True
+        logger.info(f"TTS: '{text[:80]}'")
         audio = await text_to_speech_mp3(text, voice_id)
 
         idx = audio_counter.get(session_id, 0)
@@ -124,19 +138,34 @@ async def play_on_call(session_id: str, call_uuid: str, text: str, voice_id: str
         audio_cache[key] = audio
 
         audio_url = f"https://callmybae-backend.onrender.com/api/calls/audio/{session_id}/{idx}"
-        logger.info(f"Playing {len(audio)}b via {audio_url}")
 
-        # Use async httpx instead of blocking Plivo SDK
+        # Stop anything currently playing first
+        await stop_current_audio(call_uuid)
+        await asyncio.sleep(0.1)
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"https://api.plivo.com/v1/Account/{settings.PLIVO_AUTH_ID}/Call/{call_uuid}/Play/",
                 auth=(settings.PLIVO_AUTH_ID, settings.PLIVO_AUTH_TOKEN),
                 json={"urls": audio_url, "length": 300}
             )
-            logger.info(f"Plivo play response: {resp.status_code} {resp.text[:100]}")
+            logger.info(f"Play {resp.status_code}: {resp.text[:60]}")
+
+        # Estimate playback duration: ~150 words/min, 128kbps mp3
+        # Simpler: bytes / 16000 ≈ seconds at 128kbps
+        estimated_duration = len(audio) / 16000
+        logger.info(f"Estimated duration: {estimated_duration:.1f}s, muting Deepgram")
+
+        # Wait for audio to finish playing, then unmute
+        await asyncio.sleep(estimated_duration + 0.5)
+        call_state["ai_speaking"] = False
+        logger.info("AI done speaking — Deepgram unmuted")
+        return estimated_duration
 
     except Exception as e:
+        call_state["ai_speaking"] = False
         logger.error(f"play_on_call error: {e}\n{traceback.format_exc()}")
+        return 0
 
 
 @router.get("/answer/{session_id}")
@@ -227,6 +256,9 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
         async def on_transcript(self, result, **kwargs):
             try:
+                # Skip if AI is currently speaking — would be echo
+                if call_state.get("ai_speaking", False):
+                    return
                 text = result.channel.alternatives[0].transcript.strip()
                 if not text or not ws_open:
                     return
@@ -259,7 +291,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             sample_rate=8000,
             punctuate=True,
             endpointing=600,
-            interim_results=False,   # Final only = less noise
+            interim_results=False,
         ))
         try:
             await asyncio.wait_for(dg_ready.wait(), timeout=8.0)
@@ -273,6 +305,8 @@ async def call_websocket(websocket: WebSocket, session_id: str):
     async def maybe_respond():
         nonlocal is_processing
         if is_processing or not transcript_parts or not ws_open:
+            return
+        if call_state.get("ai_speaking", False):
             return
         is_processing = True
         user_text = " ".join(transcript_parts)
@@ -290,12 +324,12 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
             call_uuid = call_state.get("call_uuid")
             if call_uuid:
-                await play_on_call(session_id, call_uuid, ai_text, companion["voice_id"])
+                await play_on_call(session_id, call_uuid, ai_text, companion["voice_id"], call_state)
 
             if call_state["is_free"] and call_state["duration"] >= settings.FREE_CALL_LIMIT_SECONDS:
                 farewell = "I have loved talking with you. Our free time is up. Create an account and we can talk whenever you want. Goodbye."
                 if call_uuid:
-                    await play_on_call(session_id, call_uuid, farewell, companion["voice_id"])
+                    await play_on_call(session_id, call_uuid, farewell, companion["voice_id"], call_state)
                 await asyncio.sleep(10)
                 try:
                     await websocket.close()
@@ -316,7 +350,6 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
                 if event == "start":
                     start_data = msg.get("start", {})
-                    # Get call UUID from Plivo start event
                     plivo_call_id = (
                         start_data.get("callId") or
                         start_data.get("call_uuid") or
@@ -331,8 +364,9 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                         opener_played = True
                         opener_text = call_state.get("opener") or \
                             f"Hey, this is {companion['name']}. So glad you picked up. How are you?"
+                        # Play opener as a task — don't block stream
                         asyncio.create_task(
-                            play_on_call(session_id, call_state.get("call_uuid", ""), opener_text, companion["voice_id"])
+                            play_on_call(session_id, call_state.get("call_uuid", ""), opener_text, companion["voice_id"], call_state)
                         )
 
                 elif event == "media":
@@ -340,7 +374,9 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                     if payload and dg_connection:
                         chunk = base64.b64decode(payload)
                         call_state["duration"] += len(chunk) / 8000
-                        await dg_connection.send(chunk)
+                        # Only send to Deepgram when user is speaking, not AI
+                        if not call_state.get("ai_speaking", False):
+                            await dg_connection.send(chunk)
 
                 elif event == "stop":
                     break
