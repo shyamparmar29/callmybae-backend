@@ -9,7 +9,7 @@ from database import get_db
 from models import Companion, CallSession, User, UserProfile, UserCredits
 from schemas import InitiateCallRequest, InitiateCallResponse, CallStatusResponse
 from auth_utils import get_optional_user
-from services.plivo_service import initiate_outbound_call, build_hangup_xml
+from services.plivo_service import initiate_outbound_call, build_hangup_xml, start_recording
 from services.ai_service import get_ai_response, get_call_opener
 from services.voice_service import text_to_speech_mp3, select_voice
 from services.memory_service import extract_memories_from_transcript, merge_memories
@@ -182,6 +182,11 @@ async def plivo_answer(session_id: str, db: AsyncSession = Depends(get_db)):
     if not session:
         return PlainTextResponse(build_hangup_xml(), media_type="application/xml")
     session.status = "connected"
+    # Start recording this call
+    call_uuid_from_params = session.plivo_call_uuid or ""
+    if call_uuid_from_params:
+        recording_cb = f"https://callmybae-backend.onrender.com/api/calls/recording/{session_id}"
+        asyncio.create_task(asyncio.to_thread(start_recording, call_uuid_from_params, recording_cb))
     await db.flush()
 
     call_state = active_calls.get(session_id, {})
