@@ -216,7 +216,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         async def on_error(self, error, **kwargs):
             logger.error(f"=== DEEPGRAM ERROR: {error} ===")
 
-        async def on_close(self, close_event, **kwargs):
+        async def on_close(self, **kwargs):
             logger.info(f"Deepgram closed: {close_event}")
 
         dg_connection.on(LiveTranscriptionEvents.Open, on_open)
