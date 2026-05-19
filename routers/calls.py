@@ -11,7 +11,7 @@ from schemas import InitiateCallRequest, InitiateCallResponse, CallStatusRespons
 from auth_utils import get_optional_user
 from services.plivo_service import initiate_outbound_call, build_hangup_xml, get_plivo_client
 from services.ai_service import get_ai_response, get_call_opener
-from services.voice_service import text_to_speech, get_voice_for_companion
+from services.voice_service import text_to_speech, text_to_speech_mulaw, get_voice_for_companion
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -224,8 +224,8 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             logger.info(f"AI: '{ai_text}'")
             call_state["history"].append({"role": "assistant", "content": ai_text})
 
-            audio_bytes = await text_to_speech(ai_text, companion["voice_id"])
-            mulaw_bytes = await convert_audio(audio_bytes)
+            mulaw_bytes = await text_to_speech_mulaw(ai_text, companion["voice_id"])
+            
 
             chunk_size = 320
             for i in range(0, len(mulaw_bytes), chunk_size):
@@ -242,8 +242,8 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
             if call_state["is_free"] and call_state["duration"] >= settings.FREE_CALL_LIMIT_SECONDS:
                 farewell = "I've really loved talking to you! Our free time is up. Create an account and we can talk whenever you want. Bye!"
-                f_audio = await text_to_speech(farewell, companion["voice_id"])
-                f_mulaw = await convert_audio(f_audio)
+                f_mulaw = await text_to_speech_mulaw(farewell, companion["voice_id"])
+                
                 for i in range(0, len(f_mulaw), chunk_size):
                     await websocket.send_json({
                         "event": "playAudio",
@@ -259,7 +259,6 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         finally:
             is_processing = False
 
-    async def convert_audio(audio_bytes: bytes) -> bytes:
         try:
             import audioop, io
             from pydub import AudioSegment

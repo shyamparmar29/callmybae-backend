@@ -15,4 +15,3 @@ plivo==4.58.0
 razorpay==1.4.1
 python-multipart==0.0.12
 websockets==13.1
-pydub==0.25.1
