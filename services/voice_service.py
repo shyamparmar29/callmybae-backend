@@ -56,7 +56,7 @@ async def text_to_speech_mp3(text: str, voice_id: str) -> bytes:
     }
     payload = {
         "text": text,
-        "model_id": "eleven_multilingual_v2",  # Better for Hindi/multilingual
+        "model_id": "eleven_turbo_v2_5",  # Fast + good quality
         "output_format": "mp3_44100_128",
         "voice_settings": {
             "stability": 0.30,          # Lower = more expressive, less robotic

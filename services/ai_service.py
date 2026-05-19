@@ -21,7 +21,7 @@ TYPE_PROMPTS = {
 }
 
 LANG_INSTRUCTIONS = {
-    "hi": "ONLY respond in pure Hindi using Devanagari script. Every word must be Hindi. NEVER use English or Roman script words. Example: 'अरे यार, सुनकर अच्छा लगा! क्या हाल है तुम्हारा?'",
+    "hi": "Respond naturally like a real young Indian person on the phone. Use natural Hinglish — mix Hindi and English the way Indians actually talk. Example: 'Arrey yaar, sun na, aaj mera din bahut bura gaya. Tu kya kar raha hai?' or 'Haan haan, bilkul samajh sakti hoon, it's totally normal to feel that way.' Keep it warm and real.",
     "en": "Respond in natural conversational English. Sound like a real person on the phone. No emojis. No asterisks.",
     "es": "Respond in natural conversational Spanish only. No emojis.",
     "fr": "Respond in natural conversational French only. No emojis.",
@@ -113,7 +113,7 @@ async def get_ai_response(name, companion_type, personalities, description, lang
     messages = conversation_history[-16:] + [{"role": "user", "content": user_message}]
     response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
-        max_tokens=100,
+        max_tokens=180,
         system=system,
         messages=messages
     )
