@@ -3,7 +3,7 @@ from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime, timezone
-import json, asyncio, base64, logging, traceback, httpx
+import json, asyncio, base64, logging, traceback, httpx, time
 
 from database import get_db
 from models import Companion, CallSession, User
@@ -79,8 +79,7 @@ async def initiate_call(
         "is_free": session.is_free_call and phone not in BYPASS_NUMBERS,
         "opener": None,
         "call_uuid": None,
-        "ai_speaking": False,
-        "speaking_until": 0.0,
+        "mute_until": 0.0,  # timestamp until which Deepgram is muted
     }
     audio_counter[session.id] = 0
 
@@ -112,7 +111,11 @@ async def serve_audio(session_id: str, index: int):
 
 
 async def play_on_call(session_id: str, call_uuid: str, text: str, voice_id: str, call_state: dict):
-    """Generate audio and inject into call via Plivo REST API. Non-blocking."""
+    """
+    Generate ElevenLabs MP3, cache it, play via Plivo REST API.
+    NO DELETE before play — DELETE kills the stream.
+    Mutes Deepgram for duration so AI doesn't hear itself.
+    """
     try:
         logger.info(f"TTS: '{text[:80]}'")
         audio = await text_to_speech_mp3(text, voice_id)
@@ -124,43 +127,22 @@ async def play_on_call(session_id: str, call_uuid: str, text: str, voice_id: str
 
         audio_url = f"https://callmybae-backend.onrender.com/api/calls/audio/{session_id}/{idx}"
 
-        # Stop current audio
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.delete(
-                    f"https://api.plivo.com/v1/Account/{settings.PLIVO_AUTH_ID}/Call/{call_uuid}/Play/",
-                    auth=(settings.PLIVO_AUTH_ID, settings.PLIVO_AUTH_TOKEN),
-                )
-        except Exception:
-            pass
+        # Mute Deepgram for audio duration + buffer
+        duration = (len(audio) / 16000) + 1.5
+        call_state["mute_until"] = time.time() + duration
+        logger.info(f"Muting Deepgram for {duration:.1f}s")
 
-        # Play new audio
+        # Play via Plivo REST — NO DELETE first
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"https://api.plivo.com/v1/Account/{settings.PLIVO_AUTH_ID}/Call/{call_uuid}/Play/",
                 auth=(settings.PLIVO_AUTH_ID, settings.PLIVO_AUTH_TOKEN),
                 json={"urls": audio_url, "length": 300}
             )
-            logger.info(f"Play {resp.status_code}")
-
-        # Mark speaking duration so Deepgram ignores echo
-        import time
-        duration = len(audio) / 16000 + 1.0
-        call_state["ai_speaking"] = True
-        call_state["speaking_until"] = time.time() + duration
-        logger.info(f"AI speaking for ~{duration:.1f}s")
-
-        # Unmute after duration — runs as separate task, doesn't block
-        async def unmute_after():
-            await asyncio.sleep(duration)
-            call_state["ai_speaking"] = False
-            call_state["speaking_until"] = 0.0
-            logger.info("Deepgram unmuted")
-
-        asyncio.create_task(unmute_after())
+            logger.info(f"Play {resp.status_code}: {resp.text[:60]}")
 
     except Exception as e:
-        call_state["ai_speaking"] = False
+        call_state["mute_until"] = 0.0
         logger.error(f"play_on_call error: {e}\n{traceback.format_exc()}")
 
 
@@ -252,8 +234,8 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
         async def on_transcript(self, result, **kwargs):
             try:
-                import time
-                if call_state.get("ai_speaking") and time.time() < call_state.get("speaking_until", 0):
+                # Skip if within mute window (AI speaking)
+                if time.time() < call_state.get("mute_until", 0):
                     return
                 text = result.channel.alternatives[0].transcript.strip()
                 if not text or not ws_open:
@@ -300,10 +282,9 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
     async def maybe_respond():
         nonlocal is_processing
-        import time
         if is_processing or not transcript_parts or not ws_open:
             return
-        if call_state.get("ai_speaking") and time.time() < call_state.get("speaking_until", 0):
+        if time.time() < call_state.get("mute_until", 0):
             return
         is_processing = True
         user_text = " ".join(transcript_parts)
@@ -365,12 +346,17 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                     if payload and dg_connection:
                         chunk = base64.b64decode(payload)
                         call_state["duration"] += len(chunk) / 8000
-                        import time
-                        if not (call_state.get("ai_speaking") and time.time() < call_state.get("speaking_until", 0)):
+                        # Only send to Deepgram outside mute window
+                        if time.time() >= call_state.get("mute_until", 0):
                             await dg_connection.send(chunk)
 
                 elif event == "stop":
-                    break
+                    logger.info("STREAM STOP received")
+                    # DON'T break here — Plivo sends stop after Play finishes
+                    # but the call is still active. Only break on WS disconnect.
+
+                else:
+                    logger.info(f"Unknown event: {event} | {str(msg)[:100]}")
 
             except json.JSONDecodeError:
                 pass
@@ -378,7 +364,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 logger.error(f"Loop error: {e}")
 
     except WebSocketDisconnect:
-        pass
+        logger.info("WS disconnected by Plivo")
     except Exception as e:
         logger.error(f"WS error: {e}")
     finally:
@@ -388,3 +374,4 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 await dg_connection.finish()
             except Exception:
                 pass
+        logger.info(f"WS closed: {session_id}")
