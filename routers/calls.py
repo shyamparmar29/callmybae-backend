@@ -290,9 +290,8 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             encoding="mulaw",
             sample_rate=8000,
             punctuate=True,
-            endpointing=300,      # 300ms silence → faster response
+            endpointing=300,
             interim_results=False,
-            utterance_end_ms="1000",
         ))
         try:
             await asyncio.wait_for(dg_ready.wait(), timeout=8.0)
