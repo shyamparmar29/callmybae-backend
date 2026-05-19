@@ -258,7 +258,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             encoding="mulaw",
             sample_rate=8000,
             punctuate=True,
-            endpointing=400,
+            endpointing=200,
             interim_results=False,
         ))
         try:

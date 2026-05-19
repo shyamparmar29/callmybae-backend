@@ -7,22 +7,22 @@ ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
 # For Hindi: use multilingual voices that handle Devanagari naturally
 VOICES = {
     "her": {
-        "warm":        "21m00Tcm4TlvDq8ikWAM",  # Rachel — warm, clear
-        "flirty":      "EXAVITQu4vr4xnSDxMaL",  # Bella — flirty
-        "playful":     "jBpfuIE2acCO8z3wKNLl",  # Gigi — young, playful
-        "intellectual":"piTKgcLEGmPE4e6mEKli",  # Nicole — thoughtful
-        "motivating":  "ThT5KcBeYPX3keUQqHPh",  # Dorothy — energetic
-        "calm":        "21m00Tcm4TlvDq8ikWAM",  # Rachel
-        "default":     "21m00Tcm4TlvDq8ikWAM",
+        "warm":        "ulZgFXalzbrnPUGQGs0S",  # Vidya — natural, modern
+        "flirty":      "RDWdsTU6N02BFftbIEAp",  # Tara — flirty
+        "playful":     "TRnaQb7q41oL7sV0w6Bu",  # Simran — young, playful
+        "intellectual":"hRclHnAGI1PGQgXUYKsd",  # Samisha — thoughtful
+        "motivating":  "r0CJZmLNXYNjo1eAJ2nq",  # Samisha — energetic
+        "calm":        "P3JECz9WQeXyyodBL3ZD",  # Gargi
+        "default":     "RDWdsTU6N02BFftbIEAp",  # Tara
     },
     "him": {
-        "warm":        "TxGEqnHWrfWFTfGW9XjX",  # Josh — warm male
-        "flirty":      "ErXwobaYiN019PkySvjV",  # Antoni — charming
+        "warm":        "5VTgCywr7NQXU8C4HA6Y",  # Laksh — warm male
+        "flirty":      "5VTgCywr7NQXU8C4HA6Y",  # Laksh — charming
         "playful":     "yoZ06aMxZJJ28mfd3POQ",  # Sam — casual
-        "intellectual":"VR6AewLTigWG4xSOukaG",  # Arnold — deep
-        "motivating":  "pNInz6obpgDQGcFmaJgB",  # Adam — strong
-        "calm":        "TxGEqnHWrfWFTfGW9XjX",  # Josh
-        "default":     "TxGEqnHWrfWFTfGW9XjX",
+        "intellectual":"YWRipq2VWH50nStdBqD1",  # Krish — deep
+        "motivating":  "CX1mcqJxcZzy2AsgaBjn",  # Luv — strong
+        "calm":        "2cdvnKJ5TZi631y5PN1s",  # Rahul
+        "default":     "5VTgCywr7NQXU8C4HA6Y",
     },
     "them": {
         "default":     "AZnzlk1XvdvUeBnXmlld",  # Domi
@@ -59,9 +59,9 @@ async def text_to_speech_mp3(text: str, voice_id: str) -> bytes:
         "model_id": "eleven_turbo_v2_5",  # Fast + good quality
         "output_format": "mp3_44100_128",
         "voice_settings": {
-            "stability": 0.30,          # Lower = more expressive, less robotic
+            "stability": 0.35,
             "similarity_boost": 0.80,
-            "style": 0.35,              # More style = more personality
+            "style": 0.45,
             "use_speaker_boost": True
         }
     }
