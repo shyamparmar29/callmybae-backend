@@ -39,6 +39,7 @@ class UserProfile(Base):
     companion_type      = Column(String(10), default="her")
     companion_language  = Column(String(10), default="hi")
     companion_personalities = Column(JSON, default=["warm"])
+    companion_description = Column(Text, nullable=True)
     # Scheduled calls
     scheduled_calls     = Column(JSON, default=[])
     # Memory bank — structured facts extracted from conversations

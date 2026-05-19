@@ -6,8 +6,6 @@ from datetime import datetime, timezone
 from database import get_db
 from models import User, UserProfile, Companion, CallSession
 from auth_utils import get_current_user
-from services.voice_service import select_voice
-from config import settings
 
 router = APIRouter()
 
@@ -19,10 +17,11 @@ async def get_or_create_profile(user: User, db: AsyncSession) -> UserProfile:
         profile = UserProfile(
             user_id=user.id,
             first_name=user.name.split()[0] if user.name else None,
-            companion_name="Luna" if not user.name else f"Luna",
+            companion_name="Luna",
             companion_type="her",
             companion_language="hi",
             companion_personalities=["warm"],
+            companion_description=None,
             memory_bank={},
             interaction_style={"call_count": 0},
             scheduled_calls=[]
@@ -36,13 +35,12 @@ async def get_or_create_profile(user: User, db: AsyncSession) -> UserProfile:
 async def get_profile(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     profile = await get_or_create_profile(user, db)
 
-    # Get stats
     calls_result = await db.execute(
         select(CallSession)
         .join(Companion, CallSession.companion_id == Companion.id)
         .where(Companion.user_id == user.id)
         .order_by(CallSession.created_at.desc())
-        .limit(10)
+        .limit(20)
     )
     recent_calls = calls_result.scalars().all()
 
@@ -66,6 +64,7 @@ async def get_profile(user: User = Depends(get_current_user), db: AsyncSession =
             "companion_type": profile.companion_type,
             "companion_language": profile.companion_language,
             "companion_personalities": profile.companion_personalities or [],
+            "companion_description": profile.companion_description,
             "scheduled_calls": profile.scheduled_calls or [],
             "total_call_minutes": round(profile.total_call_minutes or 0, 1),
             "last_call_at": profile.last_call_at.isoformat() if profile.last_call_at else None,
@@ -92,9 +91,10 @@ async def update_profile(
 ):
     profile = await get_or_create_profile(user, db)
 
-    # Update personal info
-    if "first_name" in body:
+    # ── Personal info ──
+    if "first_name" in body and body["first_name"]:
         profile.first_name = body["first_name"]
+        user.name = body["first_name"]
     if "age" in body:
         profile.age = body.get("age")
     if "city" in body:
@@ -106,8 +106,15 @@ async def update_profile(
     if "interests" in body:
         profile.interests = body.get("interests", [])
 
-    # Update companion config
-    if "companion_name" in body:
+    # ── Phone — stored on User model ──
+    if "phone" in body and body["phone"]:
+        phone = str(body["phone"]).strip().replace(" ", "").replace("-", "")
+        if not phone.startswith("+"):
+            phone = "+91" + phone
+        user.phone = phone
+
+    # ── Companion config ──
+    if "companion_name" in body and body["companion_name"]:
         profile.companion_name = body["companion_name"]
     if "companion_type" in body:
         profile.companion_type = body["companion_type"]
@@ -115,18 +122,11 @@ async def update_profile(
         profile.companion_language = body["companion_language"]
     if "companion_personalities" in body:
         profile.companion_personalities = body["companion_personalities"]
-
-    # Update scheduled calls
-    if "scheduled_calls" in body:
-        profile.scheduled_calls = body["scheduled_calls"]
+    if "companion_description" in body:
+        profile.companion_description = body.get("companion_description") or None
 
     await db.flush()
-
-    # Update user name too
-    if body.get("first_name") and user.name != body["first_name"]:
-        user.name = body["first_name"]
-
-    return {"success": True, "message": "Profile updated"}
+    return {"success": True}
 
 
 @router.get("/memory")
@@ -146,7 +146,7 @@ async def clear_memory(user: User = Depends(get_current_user), db: AsyncSession 
     profile.memory_bank = {}
     profile.interaction_style = {"call_count": 0}
     await db.flush()
-    return {"success": True, "message": "Memory cleared"}
+    return {"success": True}
 
 
 @router.get("/scheduled-calls")
@@ -161,24 +161,19 @@ async def add_scheduled_call(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    body: {
-      "time": "08:00",
-      "days": ["mon", "tue", "wed", "thu", "fri"],
-      "topic": "morning motivation",
-      "enabled": true
-    }
-    """
     profile = await get_or_create_profile(user, db)
-    scheduled = profile.scheduled_calls or []
+    scheduled = list(profile.scheduled_calls or [])
+    phone = user.phone or body.get("phone", "")
+    if not phone:
+        raise HTTPException(400, "Add your phone number in Profile before scheduling calls")
 
     new_call = {
-        "id": f"sc_{len(scheduled)+1}",
+        "id": f"sc_{len(scheduled)+1}_{int(datetime.now().timestamp())}",
         "time": body.get("time", "09:00"),
         "days": body.get("days", ["mon","tue","wed","thu","fri"]),
         "topic": body.get("topic", "general check-in"),
-        "enabled": body.get("enabled", True),
-        "phone": user.phone or body.get("phone", ""),
+        "enabled": True,
+        "phone": phone,
     }
     scheduled.append(new_call)
     profile.scheduled_calls = scheduled
@@ -199,18 +194,18 @@ async def delete_scheduled_call(
 
 
 def _summarize_memory(memory: dict) -> list[str]:
-    """Return human-readable memory bullets."""
     lines = []
     personal = memory.get("personal", {})
     if personal.get("city"):
         lines.append(f"Lives in {personal['city']}")
     if personal.get("occupation"):
         lines.append(f"Works as {personal['occupation']}")
-    for cat in ["family", "interests", "struggles", "goals", "events"]:
-        items = memory.get(cat, [])
-        for item in items[:2]:
+    if personal.get("age"):
+        lines.append(f"Age {personal['age']}")
+    for cat in ["family", "interests", "struggles", "goals", "events", "important_people"]:
+        for item in (memory.get(cat) or [])[:2]:
             lines.append(item)
-    return lines[:10]
+    return lines[:12]
 
 
 def _count_facts(memory: dict) -> int:

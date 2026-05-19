@@ -72,19 +72,21 @@ async def initiate_call(
         companion_type = profile.companion_type or body.companion_type
         personalities = profile.companion_personalities or body.personalities
         language = profile.companion_language or body.language
+        description = profile.companion_description or body.description
     else:
         voice_id = select_voice(body.companion_type, body.personalities)
         companion_name = body.companion_name
         companion_type = body.companion_type
         personalities = body.personalities
         language = body.language
+        description = body.description
 
     companion = Companion(
         user_id=user.id if user else None,
         name=companion_name,
         companion_type=companion_type,
         personalities=personalities,
-        description=body.description,
+        description=description if user else body.description,
         language=language,
         voice_id=voice_id,
     )
@@ -94,7 +96,7 @@ async def initiate_call(
     session = CallSession(
         companion_id=companion.id,
         caller_phone=phone,
-        is_free_call=(user is None or user.plan == "free") and phone not in BYPASS_NUMBERS,
+        is_free_call=(user is None) and phone not in BYPASS_NUMBERS,
         status="initiated"
     )
     db.add(session)
