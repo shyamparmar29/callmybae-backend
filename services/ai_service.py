@@ -21,7 +21,7 @@ TYPE_PROMPTS = {
 }
 
 LANG_INSTRUCTIONS = {
-    "hi": "Respond in natural conversational Hindi only. Use simple everyday Hindi words. Sound like a real Indian person talking on the phone. No English. No emojis. No asterisks.",
+    "hi": "ONLY respond in pure Hindi using Devanagari script. Every word must be Hindi. NEVER use English or Roman script words. Example: 'अरे यार, सुनकर अच्छा लगा! क्या हाल है तुम्हारा?'",
     "en": "Respond in natural conversational English. Sound like a real person on the phone. No emojis. No asterisks.",
     "es": "Respond in natural conversational Spanish only. No emojis.",
     "fr": "Respond in natural conversational French only. No emojis.",

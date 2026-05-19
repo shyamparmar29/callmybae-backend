@@ -10,8 +10,8 @@ from models import Companion, CallSession, User
 from schemas import InitiateCallRequest, InitiateCallResponse, CallStatusResponse
 from auth_utils import get_optional_user
 from services.plivo_service import initiate_outbound_call, build_hangup_xml
-from services.ai_service import get_ai_sentences, get_call_opener, strip_for_tts
-from services.voice_service import text_to_speech_mp3, text_to_speech_turbo, select_voice
+from services.ai_service import get_ai_response, get_call_opener
+from services.voice_service import text_to_speech_mp3, select_voice
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -80,8 +80,6 @@ async def initiate_call(
         "opener": None,
         "call_uuid": None,
         "mute_until": 0.0,
-        "barge_in": False,     # user interrupted AI
-        "respond_task": None,  # current response task
     }
     audio_counter[session.id] = 0
 
@@ -112,26 +110,20 @@ async def serve_audio(session_id: str, index: int):
     return Response(content=audio, media_type="audio/mpeg")
 
 
-async def play_audio_chunk(session_id: str, call_uuid: str, text: str,
-                           voice_id: str, call_state: dict,
-                           use_turbo: bool = False) -> float:
-    """
-    Generate TTS for one sentence chunk and play it.
-    Returns estimated duration so caller can sequence playback.
-    """
+async def play_on_call(session_id: str, call_uuid: str, text: str,
+                       voice_id: str, call_state: dict) -> float:
+    """Generate TTS and play via Plivo REST. Returns duration seconds."""
     try:
-        if use_turbo:
-            audio = await text_to_speech_turbo(text, voice_id)
-        else:
-            audio = await text_to_speech_mp3(text, voice_id)
-
+        audio = await text_to_speech_mp3(text, voice_id)
         idx = audio_counter.get(session_id, 0)
         audio_counter[session_id] = idx + 1
         key = f"{session_id}_{idx}"
         audio_cache[key] = audio
-
         audio_url = f"https://callmybae-backend.onrender.com/api/calls/audio/{session_id}/{idx}"
-        duration = len(audio) / 16000 + 0.3
+        duration = len(audio) / 16000 + 0.5
+
+        # Mute Deepgram for duration so AI doesn't hear itself
+        call_state["mute_until"] = time.time() + duration
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
@@ -139,25 +131,12 @@ async def play_audio_chunk(session_id: str, call_uuid: str, text: str,
                 auth=(settings.PLIVO_AUTH_ID, settings.PLIVO_AUTH_TOKEN),
                 json={"urls": audio_url, "length": 300}
             )
-            if resp.status_code != 202:
-                logger.warning(f"Play {resp.status_code}: {resp.text[:60]}")
+            logger.info(f"Play {resp.status_code}")
 
         return duration
     except Exception as e:
-        logger.error(f"play_audio_chunk error: {e}")
+        logger.error(f"play_on_call error: {e}")
         return 0
-
-
-async def stop_playback(call_uuid: str):
-    """Barge-in: immediately stop current audio."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.delete(
-                f"https://api.plivo.com/v1/Account/{settings.PLIVO_AUTH_ID}/Call/{call_uuid}/Play/",
-                auth=(settings.PLIVO_AUTH_ID, settings.PLIVO_AUTH_TOKEN),
-            )
-    except Exception:
-        pass
 
 
 @router.get("/answer/{session_id}")
@@ -166,13 +145,11 @@ async def plivo_answer(session_id: str, db: AsyncSession = Depends(get_db)):
     session = result.scalar_one_or_none()
     if not session:
         return PlainTextResponse(build_hangup_xml(), media_type="application/xml")
-
     session.status = "connected"
     await db.flush()
 
     call_state = active_calls.get(session_id, {})
     companion = call_state.get("companion", {})
-
     opener = get_call_opener(
         companion.get("name", "Luna"),
         companion.get("type", "her"),
@@ -248,24 +225,15 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
         async def on_transcript(self, result, **kwargs):
             try:
+                if time.time() < call_state.get("mute_until", 0):
+                    return  # AI speaking, ignore
                 text = result.channel.alternatives[0].transcript.strip()
                 if not text or not ws_open:
                     return
-
                 if result.is_final:
-                    now = time.time()
-                    if now < call_state.get("mute_until", 0):
-                        # User is speaking while AI is playing — BARGE IN
-                        logger.info(f"BARGE-IN: '{text}'")
-                        call_state["barge_in"] = True
-                        call_state["mute_until"] = 0.0
-                        call_uuid = call_state.get("call_uuid")
-                        if call_uuid:
-                            asyncio.create_task(stop_playback(call_uuid))
                     logger.info(f"HEARD: '{text}'")
                     transcript_parts.append(text)
                     asyncio.create_task(maybe_respond())
-
             except Exception as e:
                 logger.error(f"Transcript error: {e}")
 
@@ -290,7 +258,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             encoding="mulaw",
             sample_rate=8000,
             punctuate=True,
-            endpointing=300,
+            endpointing=400,
             interim_results=False,
         ))
         try:
@@ -306,63 +274,37 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         nonlocal is_processing
         if is_processing or not transcript_parts or not ws_open:
             return
+        if time.time() < call_state.get("mute_until", 0):
+            return
         is_processing = True
         user_text = " ".join(transcript_parts)
         transcript_parts.clear()
-        call_state["barge_in"] = False
-        logger.info(f"RESPONDING TO: '{user_text}'")
-
+        logger.info(f"RESPONDING: '{user_text}'")
         try:
             call_state["history"].append({"role": "user", "content": user_text})
-            call_uuid = call_state.get("call_uuid", "")
-            voice_id = companion["voice_id"]
-
-            full_response = ""
-            sentence_num = 0
-            playback_time = time.time()
-
-            # SENTENCE STREAMING: play first sentence immediately,
-            # then sequence the rest — cuts perceived latency in half
-            async for sentence in get_ai_sentences(
+            ai_text = await get_ai_response(
                 companion["name"], companion["type"], companion["personalities"],
                 companion["description"], companion["language"],
                 call_state["history"], user_text
-            ):
-                if call_state.get("barge_in"):
-                    logger.info("Barge-in detected, stopping response")
-                    break
+            )
+            logger.info(f"AI: '{ai_text}'")
+            call_state["history"].append({"role": "assistant", "content": ai_text})
 
-                full_response += sentence + " "
-                logger.info(f"Sentence {sentence_num}: '{sentence}'")
-
-                # Mute deepgram for this sentence's duration
-                estimated = len(sentence) * 0.06 + 1.0  # rough estimate before TTS
-                call_state["mute_until"] = time.time() + estimated + 3.0
-
-                duration = await play_audio_chunk(
-                    session_id, call_uuid, sentence, voice_id, call_state,
-                    use_turbo=(sentence_num > 0)  # first sentence = quality, rest = speed
+            call_uuid = call_state.get("call_uuid")
+            if call_uuid:
+                duration = await play_on_call(
+                    session_id, call_uuid, ai_text,
+                    companion["voice_id"], call_state
                 )
-
-                # Update mute to actual duration
-                call_state["mute_until"] = time.time() + duration + 0.5
-
-                sentence_num += 1
-
-                # Wait for current sentence to finish before playing next
-                await asyncio.sleep(max(0, duration - 0.2))
-
-            # Store full response in history
-            if full_response.strip():
-                call_state["history"].append({"role": "assistant", "content": full_response.strip()})
+                logger.info(f"Playing for {duration:.1f}s")
 
             if call_state["is_free"] and call_state["duration"] >= settings.FREE_CALL_LIMIT_SECONDS:
-                farewell_lang = {
-                    "hi": "यार, हमारा फ्री समय खत्म हो गया। अकाउंट बनाओ और फिर मिलते हैं।",
+                farewell = {
+                    "hi": "यार फ्री टाइम खत्म हो गया। अकाउंट बनाओ और फिर बात करते हैं।",
                     "en": "Our free time is up. Create an account and we can talk anytime. Bye!"
-                }
-                farewell = farewell_lang.get(companion["language"], farewell_lang["en"])
-                await play_audio_chunk(session_id, call_uuid, farewell, voice_id, call_state)
+                }.get(companion["language"], "Our free time is up. Bye!")
+                if call_uuid:
+                    await play_on_call(session_id, call_uuid, farewell, companion["voice_id"], call_state)
 
         except Exception as e:
             logger.error(f"Response error: {e}\n{traceback.format_exc()}")
@@ -393,30 +335,23 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                         opener_played = True
                         opener_text = call_state.get("opener") or \
                             f"Hey, it's {companion['name']}. How are you?"
+                        # Mute BEFORE creating task so barge-in doesn't fire during opener
+                        opener_est = len(opener_text) * 0.07 + 3.0
+                        call_state["mute_until"] = time.time() + opener_est
                         asyncio.create_task(
-                            play_audio_chunk(session_id, call_state.get("call_uuid", ""),
-                                           opener_text, companion["voice_id"], call_state,
-                                           use_turbo=False)
+                            play_on_call(session_id, call_state.get("call_uuid", ""),
+                                        opener_text, companion["voice_id"], call_state)
                         )
-                        # Mute during opener
-                        opener_duration = len(opener_text) * 0.065 + 2.0
-                        call_state["mute_until"] = time.time() + opener_duration
 
                 elif event == "media":
                     payload = msg.get("media", {}).get("payload", "")
                     if payload and dg_connection:
                         chunk = base64.b64decode(payload)
                         call_state["duration"] += len(chunk) / 8000
-                        # Send to Deepgram — even during mute window
-                        # (transcript callback handles the mute logic)
                         await dg_connection.send(chunk)
 
                 elif event == "stop":
-                    # Plivo sends stop after Play finishes — don't break
-                    logger.info("Play completed event")
-
-                else:
-                    pass  # ignore unknown events
+                    pass  # ignore, Plivo sends this after Play finishes
 
             except json.JSONDecodeError:
                 pass
