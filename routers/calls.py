@@ -11,7 +11,7 @@ from schemas import InitiateCallRequest, InitiateCallResponse, CallStatusRespons
 from auth_utils import get_optional_user
 from services.plivo_service import initiate_outbound_call, build_hangup_xml
 from services.ai_service import get_ai_response, get_call_opener
-from services.voice_service import text_to_speech_mulaw, get_voice_for_companion
+from services.voice_service import text_to_speech_mulaw, select_voice
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,9 @@ async def initiate_call(
         if len(result.scalars().all()) >= 1:
             raise HTTPException(403, "Free call already used. Please create an account.")
 
-    voice_id = get_voice_for_companion(body.companion_type)
+    # Smart voice selection based on type + personalities
+    voice_id = select_voice(body.companion_type, body.personalities)
+
     companion = Companion(
         user_id=user.id if user else None,
         name=body.companion_name,
@@ -84,7 +86,6 @@ async def initiate_call(
         session.status = "ringing"
     except Exception as e:
         logger.error(f"Plivo call failed: {e}")
-        session.status = "failed"
         raise HTTPException(500, f"Plivo call failed: {str(e)}")
 
     await db.flush()
@@ -116,7 +117,7 @@ async def plivo_answer(session_id: str, db: AsyncSession = Depends(get_db)):
         companion.get("language", "en"),
     )
     call_state["opener"] = opener
-    logger.info(f"Opener set: {opener}")
+    logger.info(f"Answer webhook: opener='{opener[:60]}...'")
 
     ws_url = f"wss://callmybae-backend.onrender.com/api/calls/ws/{session_id}"
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -157,28 +158,32 @@ async def call_status(session_id: str, db: AsyncSession = Depends(get_db)):
 
 
 async def _send_audio(websocket: WebSocket, mulaw_bytes: bytes):
+    """Send mulaw audio to Plivo in 20ms chunks."""
     chunk_size = 320
     for i in range(0, len(mulaw_bytes), chunk_size):
         chunk = mulaw_bytes[i:i + chunk_size]
-        await websocket.send_json({
-            "event": "playAudio",
-            "media": {
-                "contentType": "audio/x-mulaw",
-                "sampleRate": 8000,
-                "payload": base64.b64encode(chunk).decode()
-            }
-        })
+        try:
+            await websocket.send_json({
+                "event": "playAudio",
+                "media": {
+                    "contentType": "audio/x-mulaw",
+                    "sampleRate": 8000,
+                    "payload": base64.b64encode(chunk).decode()
+                }
+            })
+        except Exception:
+            return  # WebSocket closed, stop sending
         await asyncio.sleep(0.018)
 
 
 @router.websocket("/ws/{session_id}")
 async def call_websocket(websocket: WebSocket, session_id: str):
     await websocket.accept()
-    logger.info(f"=== WS CONNECTED: {session_id} ===")
+    logger.info(f"=== WS OPEN: {session_id} ===")
 
     call_state = active_calls.get(session_id)
     if not call_state:
-        logger.error(f"No call state for {session_id}. Active: {list(active_calls.keys())}")
+        logger.error(f"No call state for {session_id}")
         await websocket.close(code=1008)
         return
 
@@ -188,10 +193,11 @@ async def call_websocket(websocket: WebSocket, session_id: str):
     dg_connection = None
     transcript_parts: list[str] = []
     is_processing = False
+    ws_open = True
 
     # ── Setup Deepgram ──
     try:
-        logger.info("Setting up Deepgram...")
+        logger.info("Connecting Deepgram...")
         from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
         dg_client = DeepgramClient(settings.DEEPGRAM_API_KEY)
         dg_connection = dg_client.listen.asynclive.v("1")
@@ -206,50 +212,52 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 text = result.channel.alternatives[0].transcript.strip()
                 if not text:
                     return
-                logger.info(f"TRANSCRIPT ({'FINAL' if result.is_final else 'interim'}): '{text}'")
-                if result.is_final and text:
+                logger.info(f"HEARD ({'FINAL' if result.is_final else 'interim'}): '{text}'")
+                if result.is_final and ws_open:
                     transcript_parts.append(text)
                     asyncio.create_task(maybe_respond())
             except Exception as e:
-                logger.error(f"Transcript cb: {e}\n{traceback.format_exc()}")
+                logger.error(f"Transcript error: {e}")
 
         async def on_error(self, error, **kwargs):
-            logger.error(f"=== DEEPGRAM ERROR: {error} ===")
+            logger.error(f"Deepgram error: {error}")
 
         async def on_close(self, **kwargs):
-            logger.info(f"Deepgram closed: {close_event}")
+            logger.info("Deepgram closed")
 
         dg_connection.on(LiveTranscriptionEvents.Open, on_open)
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_transcript)
         dg_connection.on(LiveTranscriptionEvents.Error, on_error)
         dg_connection.on(LiveTranscriptionEvents.Close, on_close)
 
-        lang = "hi" if companion["language"] == "hi" else "en-IN"
-        logger.info(f"Starting Deepgram with lang={lang}")
+        # Tell Deepgram we're sending mulaw 8kHz
+        lang = "hi" if companion["language"] == "hi" else \
+               companion["language"] if len(companion["language"]) == 2 else "en"
+
         started = await dg_connection.start(LiveOptions(
             model="nova-2",
             language=lang,
+            encoding="mulaw",
+            sample_rate=8000,
             punctuate=True,
             endpointing=800,
             interim_results=True,
-            encoding="mulaw",
-            sample_rate=8000,
         ))
-        logger.info(f"Deepgram start returned: {started}")
+        logger.info(f"Deepgram start: {started}")
 
         try:
             await asyncio.wait_for(dg_ready.wait(), timeout=8.0)
             logger.info("=== DEEPGRAM READY ===")
         except asyncio.TimeoutError:
-            logger.error("Deepgram ready timeout — proceeding anyway")
+            logger.warning("Deepgram ready timeout — continuing")
 
     except Exception as e:
-        logger.error(f"Deepgram setup FAILED: {e}\n{traceback.format_exc()}")
+        logger.error(f"Deepgram FAILED: {e}\n{traceback.format_exc()}")
         dg_connection = None
 
     async def maybe_respond():
         nonlocal is_processing
-        if is_processing or not transcript_parts:
+        if is_processing or not transcript_parts or not ws_open:
             return
         is_processing = True
         user_text = " ".join(transcript_parts)
@@ -262,10 +270,10 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 companion["description"], companion["language"],
                 call_state["history"], user_text
             )
-            logger.info(f"=== AI SAYS: '{ai_text}' ===")
+            logger.info(f"=== AI: '{ai_text}' ===")
             call_state["history"].append({"role": "assistant", "content": ai_text})
             mulaw = await text_to_speech_mulaw(ai_text, companion["voice_id"])
-            logger.info(f"TTS got {len(mulaw)} bytes mulaw")
+            logger.info(f"TTS: {len(mulaw)} bytes")
             await _send_audio(websocket, mulaw)
 
             if call_state["is_free"] and call_state["duration"] >= settings.FREE_CALL_LIMIT_SECONDS:
@@ -273,25 +281,16 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 f_mulaw = await text_to_speech_mulaw(farewell, companion["voice_id"])
                 await _send_audio(websocket, f_mulaw)
                 await asyncio.sleep(6)
-                await websocket.close()
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
         except Exception as e:
-            logger.error(f"maybe_respond error: {e}\n{traceback.format_exc()}")
+            logger.error(f"Response error: {e}\n{traceback.format_exc()}")
         finally:
             is_processing = False
 
-    async def play_opener():
-        try:
-            text = call_state.get("opener") or f"Hey! This is {companion['name']}. So happy you picked up! How are you doing?"
-            logger.info(f"=== PLAYING OPENER: '{text}' ===")
-            mulaw = await text_to_speech_mulaw(text, companion["voice_id"])
-            logger.info(f"Opener TTS: {len(mulaw)} bytes")
-            await _send_audio(websocket, mulaw)
-            logger.info("Opener sent successfully")
-        except Exception as e:
-            logger.error(f"Opener error: {e}\n{traceback.format_exc()}")
-
-    opener_played = False
-
+    # ── Main loop ──
     try:
         async for raw_msg in websocket.iter_text():
             try:
@@ -299,36 +298,43 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 event = msg.get("event", "")
 
                 if event == "start":
-                    logger.info(f"=== STREAM START ===")
-                    if not opener_played:
-                        opener_played = True
-                        asyncio.create_task(play_opener())
+                    logger.info("=== STREAM START — playing opener ===")
+                    # AWAIT directly — don't use create_task
+                    # This blocks the loop briefly but that's fine,
+                    # Plivo buffers incoming audio while we play the opener
+                    opener_text = call_state.get("opener") or \
+                        f"Hey! This is {companion['name']}. So happy you picked up! How are you doing?"
+                    logger.info(f"Opener: '{opener_text}'")
+                    try:
+                        mulaw = await text_to_speech_mulaw(opener_text, companion["voice_id"])
+                        logger.info(f"Opener TTS: {len(mulaw)} bytes — sending...")
+                        await _send_audio(websocket, mulaw)
+                        logger.info("Opener sent ✓")
+                    except Exception as e:
+                        logger.error(f"Opener TTS failed: {e}\n{traceback.format_exc()}")
 
                 elif event == "media":
                     payload = msg.get("media", {}).get("payload", "")
-                    if payload:
+                    if payload and dg_connection:
                         chunk = base64.b64decode(payload)
                         call_state["duration"] += len(chunk) / 8000
-                        if dg_connection:
-                            await dg_connection.send(chunk)
+                        await dg_connection.send(chunk)
 
                 elif event == "stop":
                     logger.info("=== STREAM STOP ===")
                     break
 
-                elif event not in ("start", "media", "stop"):
-                    logger.info(f"Unknown event: {event}")
-
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error: {e} | raw: {raw_msg[:100]}")
+            except json.JSONDecodeError:
+                pass
             except Exception as e:
                 logger.error(f"Loop error: {e}\n{traceback.format_exc()}")
 
     except WebSocketDisconnect:
         logger.info(f"WS disconnected: {session_id}")
     except Exception as e:
-        logger.error(f"WS outer error: {e}\n{traceback.format_exc()}")
+        logger.error(f"WS error: {e}\n{traceback.format_exc()}")
     finally:
+        ws_open = False
         if dg_connection:
             try:
                 await dg_connection.finish()
