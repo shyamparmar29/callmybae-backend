@@ -197,6 +197,15 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         is_processing = False
         response_lock = asyncio.Lock()
 
+    async def play_opener(text: str):
+        try:
+            logger.info(f"Playing opener: {text}")
+            mulaw = await text_to_speech_mulaw(text, companion["voice_id"])
+            await send_audio(websocket, mulaw)
+        except Exception as e:
+            logger.error(f"Opener error: {e}")
+
+
         async def on_open(self, open_event, **kwargs):
             logger.info("Deepgram opened")
             dg_ready.set()
@@ -321,10 +330,3 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 pass
         logger.info(f"WS closed: {session_id}")
 
-    async def play_opener(text: str):
-        try:
-            logger.info(f"Playing opener: {text}")
-            mulaw = await text_to_speech_mulaw(text, companion["voice_id"])
-            await send_audio(websocket, mulaw)
-        except Exception as e:
-            logger.error(f"Opener error: {e}")
