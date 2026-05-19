@@ -16,11 +16,10 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
 active_calls: dict[str, dict] = {}
 
-# Numbers that bypass free call limit (your test numbers)
-BYPASS_NUMBERS = ["+919601971754", "+918849798063", "+917016XXXXXX"]  # add yours
+BYPASS_NUMBERS = ["+919601971754", "+918849798063"]
+
 
 @router.post("/initiate", response_model=InitiateCallResponse)
 async def initiate_call(
@@ -32,7 +31,6 @@ async def initiate_call(
     if not phone.startswith("+"):
         phone = "+91" + phone
 
-    # Skip free call check for bypass numbers and logged-in users
     if not user and phone not in BYPASS_NUMBERS:
         result = await db.execute(
             select(CallSession).where(
@@ -41,7 +39,7 @@ async def initiate_call(
             )
         )
         if len(result.scalars().all()) >= 1:
-            raise HTTPException(403, "Free call already used. Please create an account to continue.")
+            raise HTTPException(403, "Free call already used. Please create an account.")
 
     voice_id = get_voice_for_companion(body.companion_type)
     companion = Companion(
@@ -77,6 +75,7 @@ async def initiate_call(
         "history": [],
         "duration": 0,
         "is_free": session.is_free_call and phone not in BYPASS_NUMBERS,
+        "opener": None,
     }
 
     try:
@@ -95,6 +94,7 @@ async def initiate_call(
         status=session.status,
         message=f"Calling {phone} now!"
     )
+
 
 @router.get("/answer/{session_id}")
 async def plivo_answer(session_id: str, db: AsyncSession = Depends(get_db)):
@@ -115,21 +115,17 @@ async def plivo_answer(session_id: str, db: AsyncSession = Depends(get_db)):
         companion.get("personalities", []),
         companion.get("language", "en"),
     )
-
-    # Store opener to play via WebSocket (ElevenLabs voice)
     call_state["opener"] = opener
 
     ws_url = f"wss://callmybae-backend.onrender.com/api/calls/ws/{session_id}"
-
-    # Minimal XML — just open the stream, opener plays via WebSocket
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Stream streamTimeout="300" keepCallAlive="true" bidirectional="true" audioTrack="inbound" contentType="audio/x-mulaw;rate=8000" maxDuration="300">
         {ws_url}
     </Stream>
 </Response>"""
-
     return PlainTextResponse(xml, media_type="application/xml")
+
 
 @router.post("/hangup/{session_id}")
 async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Depends(get_db)):
@@ -144,6 +140,7 @@ async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Dep
         await db.flush()
     return {"ok": True}
 
+
 @router.get("/status/{session_id}", response_model=CallStatusResponse)
 async def call_status(session_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(CallSession).where(CallSession.id == session_id))
@@ -157,9 +154,9 @@ async def call_status(session_id: str, db: AsyncSession = Depends(get_db)):
         is_free_call=session.is_free_call,
     )
 
-async def send_audio(websocket: WebSocket, mulaw_bytes: bytes):
-    """Send mulaw audio to Plivo in 20ms chunks."""
-    chunk_size = 320  # 20ms at 8kHz mulaw
+
+async def _send_audio(websocket: WebSocket, mulaw_bytes: bytes):
+    chunk_size = 320
     for i in range(0, len(mulaw_bytes), chunk_size):
         chunk = mulaw_bytes[i:i + chunk_size]
         await websocket.send_json({
@@ -172,6 +169,7 @@ async def send_audio(websocket: WebSocket, mulaw_bytes: bytes):
         })
         await asyncio.sleep(0.018)
 
+
 @router.websocket("/ws/{session_id}")
 async def call_websocket(websocket: WebSocket, session_id: str):
     await websocket.accept()
@@ -179,15 +177,13 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
     call_state = active_calls.get(session_id)
     if not call_state:
-        logger.error(f"No call state for {session_id} — active: {list(active_calls.keys())}")
+        logger.error(f"No call state for {session_id}")
         await websocket.close(code=1008)
         return
 
     companion = call_state["companion"]
-    logger.info(f"Companion: {companion['name']} ({companion['type']})")
-
-    # ── Setup Deepgram ──
     dg_connection = None
+
     try:
         from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
         dg_client = DeepgramClient(settings.DEEPGRAM_API_KEY)
@@ -197,21 +193,11 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         is_processing = False
         response_lock = asyncio.Lock()
 
-    async def play_opener(text: str):
-        try:
-            logger.info(f"Playing opener: {text}")
-            mulaw = await text_to_speech_mulaw(text, companion["voice_id"])
-            await send_audio(websocket, mulaw)
-        except Exception as e:
-            logger.error(f"Opener error: {e}")
-
-
         async def on_open(self, open_event, **kwargs):
             logger.info("Deepgram opened")
             dg_ready.set()
 
         async def on_transcript(self, result, **kwargs):
-            nonlocal is_processing
             try:
                 text = result.channel.alternatives[0].transcript.strip()
                 if not text:
@@ -221,93 +207,88 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                     transcript_parts.append(text)
                     asyncio.create_task(maybe_respond())
             except Exception as e:
-                logger.error(f"Transcript error: {e}")
+                logger.error(f"Transcript cb error: {e}")
 
         async def on_error(self, error, **kwargs):
             logger.error(f"Deepgram error: {error}")
+
+        async def maybe_respond():
+            nonlocal is_processing
+            async with response_lock:
+                if is_processing or not transcript_parts:
+                    return
+                is_processing = True
+                user_text = " ".join(transcript_parts)
+                transcript_parts.clear()
+
+            logger.info(f"Responding to: '{user_text}'")
+            try:
+                call_state["history"].append({"role": "user", "content": user_text})
+                ai_text = await get_ai_response(
+                    companion["name"], companion["type"], companion["personalities"],
+                    companion["description"], companion["language"],
+                    call_state["history"], user_text
+                )
+                logger.info(f"AI says: '{ai_text}'")
+                call_state["history"].append({"role": "assistant", "content": ai_text})
+                mulaw = await text_to_speech_mulaw(ai_text, companion["voice_id"])
+                await _send_audio(websocket, mulaw)
+
+                if call_state["is_free"] and call_state["duration"] >= settings.FREE_CALL_LIMIT_SECONDS:
+                    farewell = "I have loved talking with you! Our free time is up. Create an account and we can talk whenever you want. Bye for now!"
+                    f_mulaw = await text_to_speech_mulaw(farewell, companion["voice_id"])
+                    await _send_audio(websocket, f_mulaw)
+                    await asyncio.sleep(6)
+                    await websocket.close()
+            except Exception as e:
+                logger.error(f"Response error: {e}")
+            finally:
+                is_processing = False
+
+        async def play_opener():
+            try:
+                text = call_state.get("opener", f"Hey! This is {companion['name']}. So glad you picked up! How are you?")
+                logger.info(f"Playing opener: {text}")
+                mulaw = await text_to_speech_mulaw(text, companion["voice_id"])
+                await _send_audio(websocket, mulaw)
+            except Exception as e:
+                logger.error(f"Opener error: {e}")
 
         dg_connection.on(LiveTranscriptionEvents.Open, on_open)
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_transcript)
         dg_connection.on(LiveTranscriptionEvents.Error, on_error)
 
         lang = "hi" if companion["language"] == "hi" else "en-IN"
-        options = LiveOptions(
+        started = await dg_connection.start(LiveOptions(
             model="nova-2",
             language=lang,
             punctuate=True,
             endpointing=800,
             interim_results=True,
-        )
-        started = await dg_connection.start(options)
-        logger.info(f"Deepgram start result: {started}")
+        ))
+        logger.info(f"Deepgram start: {started}")
         await asyncio.wait_for(dg_ready.wait(), timeout=8.0)
-        logger.info("Deepgram ready ✓")
+        logger.info("Deepgram ready")
 
-    except Exception as e:
-        logger.error(f"Deepgram setup failed: {e}")
-        await websocket.close()
-        return
+        opener_played = False
 
-    async def maybe_respond():
-        nonlocal is_processing
-        async with response_lock:
-            if is_processing or not transcript_parts:
-                return
-            is_processing = True
-            user_text = " ".join(transcript_parts)
-            transcript_parts.clear()
-
-        logger.info(f"Responding to: '{user_text}'")
-        try:
-            call_state["history"].append({"role": "user", "content": user_text})
-            ai_text = await get_ai_response(
-                companion["name"], companion["type"], companion["personalities"],
-                companion["description"], companion["language"],
-                call_state["history"], user_text
-            )
-            logger.info(f"AI says: '{ai_text}'")
-            call_state["history"].append({"role": "assistant", "content": ai_text})
-
-            mulaw = await text_to_speech_mulaw(ai_text, companion["voice_id"])
-            await send_audio(websocket, mulaw)
-
-            # Free call limit
-            if call_state["is_free"] and call_state["duration"] >= settings.FREE_CALL_LIMIT_SECONDS:
-                farewell = "I've loved talking with you! Our free time is up. Create an account and we can talk whenever you want. Bye for now!"
-                f_mulaw = await text_to_speech_mulaw(farewell, companion["voice_id"])
-                await send_audio(websocket, f_mulaw)
-                await asyncio.sleep(6)
-                await websocket.close()
-
-        except Exception as e:
-            logger.error(f"Response error: {e}")
-        finally:
-            is_processing = False
-
-    # ── Play opener immediately when stream starts ──
-    opener_played = False
-
-    # ── Main receive loop ──
-    try:
         async for raw_msg in websocket.iter_text():
             try:
                 msg = json.loads(raw_msg)
                 event = msg.get("event", "")
 
                 if event == "start":
-                    logger.info(f"Stream started: {msg}")
-                    # Play ElevenLabs opener now
-                    if not opener_played and call_state.get("opener"):
+                    logger.info(f"Stream start received")
+                    if not opener_played:
                         opener_played = True
-                        asyncio.create_task(play_opener(call_state["opener"]))
+                        asyncio.create_task(play_opener())
 
                 elif event == "media":
                     payload = msg.get("media", {}).get("payload", "")
                     if payload:
                         chunk = base64.b64decode(payload)
                         call_state["duration"] += len(chunk) / 8000
-                        if dg_connection:
-                            await dg_connection.send(chunk)
+                        await dg_connection.send(chunk)
 
                 elif event == "stop":
                     logger.info("Stream stop")
@@ -329,4 +310,3 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             except Exception:
                 pass
         logger.info(f"WS closed: {session_id}")
-
