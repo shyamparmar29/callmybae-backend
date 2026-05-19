@@ -1,13 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-import uvicorn
-import logging
+import uvicorn, logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 from database import create_tables
-from routers import auth, companions, calls, payments, whatsapp, admin
+from routers import auth, companions, calls, payments, whatsapp, admin, profile, credits
 from config import settings
 
 @asynccontextmanager
@@ -15,16 +14,11 @@ async def lifespan(app: FastAPI):
     await create_tables()
     yield
 
-app = FastAPI(title="CallMyBae API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="CallMyBae API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://callmybae.com",
-        "https://www.callmybae.com",
-        "http://localhost:3000",
-        "http://localhost:8080",
-    ],
+    allow_origins=["https://callmybae.com", "https://www.callmybae.com", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,14 +30,13 @@ app.include_router(calls.router,      prefix="/api/calls",       tags=["calls"])
 app.include_router(payments.router,   prefix="/api/payments",    tags=["payments"])
 app.include_router(whatsapp.router,   prefix="/api/whatsapp",    tags=["whatsapp"])
 app.include_router(admin.router,      prefix="/api/admin",       tags=["admin"])
+app.include_router(profile.router,    prefix="/api/profile",     tags=["profile"])
+app.include_router(credits.router,    prefix="/api/credits",     tags=["credits"])
 
 @app.get("/")
 async def root():
-    return {"status": "CallMyBae API", "version": "1.0.0"}
+    return {"status": "CallMyBae API v2", "version": "2.0.0"}
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

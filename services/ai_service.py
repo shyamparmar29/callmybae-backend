@@ -1,8 +1,10 @@
 import anthropic
 import re
-from typing import AsyncGenerator
+import logging
 from config import settings
+from services.memory_service import build_memory_context, build_personality_evolution_context
 
+logger = logging.getLogger(__name__)
 client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 PERSONALITY_PROMPTS = {
@@ -21,95 +23,70 @@ TYPE_PROMPTS = {
 }
 
 LANG_INSTRUCTIONS = {
-    "hi": "Respond naturally like a real young Indian person on the phone. Use natural Hinglish — mix Hindi and English the way Indians actually talk. Example: 'Arrey yaar, sun na, aaj mera din bahut bura gaya. Tu kya kar raha hai?' or 'Haan haan, bilkul samajh sakti hoon, it's totally normal to feel that way.' Keep it warm and real.",
-    "en": "Respond in natural conversational English. Sound like a real person on the phone. No emojis. No asterisks.",
-    "es": "Respond in natural conversational Spanish only. No emojis.",
-    "fr": "Respond in natural conversational French only. No emojis.",
-    "de": "Respond in natural conversational German only. No emojis.",
-    "ta": "Respond in natural conversational Tamil only. No emojis.",
-    "te": "Respond in natural conversational Telugu only. No emojis.",
+    "hi": "Respond naturally like a real young Indian person on the phone. Mix Hindi and English the way Indians actually talk (Hinglish). Example: 'Arrey yaar, sun na, sab theek hai na? Kya hua aaj?' Keep it real and warm.",
+    "en": "Respond in natural conversational English. Sound like a real person on the phone. Warm and genuine.",
+    "es": "Respond in natural conversational Spanish.",
+    "fr": "Respond in natural conversational French.",
+    "de": "Respond in natural conversational German.",
+    "ta": "Respond in natural conversational Tamil.",
+    "te": "Respond in natural conversational Telugu.",
 }
 
-SENTENCE_ENDINGS = re.compile(r'(?<=[।.!?])\s+')
-
 def strip_for_tts(text: str) -> str:
-    """Remove anything that makes TTS sound robotic."""
-    # Remove emojis
     text = re.sub(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF'
                   r'\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF'
                   r'\U00002702-\U000027B0\U000024C2-\U0001F251]+', '', text)
-    # Remove markdown
     text = re.sub(r'[\*\_\`\#\[\]\(\)]', '', text)
-    # Clean up spaces
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def build_system_prompt(name, companion_type, personalities, description, language):
+def build_system_prompt(name, companion_type, personalities, description, language,
+                        memory_bank=None, interaction_style=None, user_name=None):
     base = TYPE_PROMPTS.get(companion_type, TYPE_PROMPTS["her"]).format(name=name)
     traits = " and ".join([PERSONALITY_PROMPTS[p] for p in personalities if p in PERSONALITY_PROMPTS])
     if not traits:
         traits = "warm and genuine"
-    custom = f"\n\nPersonality: {description}" if description else ""
+    custom = f"\n\nPersonality details: {description}" if description else ""
     lang = LANG_INSTRUCTIONS.get(language, LANG_INSTRUCTIONS["en"])
+
+    # Build memory context
+    memory_ctx = ""
+    if memory_bank:
+        memory_ctx = build_memory_context(memory_bank, user_name)
+    
+    personality_ctx = ""
+    if interaction_style:
+        personality_ctx = build_personality_evolution_context(interaction_style)
+
+    user_ref = f"Their name is {user_name}. " if user_name else ""
 
     return f"""{base}
 
 Your character: {traits}.{custom}
 
-PHONE CALL RULES — follow exactly:
-- Maximum 2 SHORT sentences per response. This is a phone call.
-- Sound 100% human. Natural pauses, filler words like "yaar", "haan", "accha" in Hindi, "oh wow", "yeah" in English.
+{user_ref}You are on a REAL PHONE CALL. Critical rules:
+- 1-2 SHORT sentences maximum. This is a phone call, not an essay.
+- Sound 100% human. Natural, warm, genuine.
 - NEVER say you are an AI. You are {name}. Always.
-- No emojis. No lists. No markdown. No asterisks.
-- Ask one follow-up question or make one natural comment per turn.
-- React emotionally — laugh, be surprised, be concerned based on what they say.
-- Use their name if you know it.
+- No emojis. No lists. No markdown.
+- React emotionally to what they say.
+- Use their name occasionally to make it personal.
+- If they seem upset, be present and caring first before asking questions.
 
-{lang}"""
+{lang}
 
-async def get_ai_sentences(
-    name, companion_type, personalities, description, language,
-    conversation_history, user_message
-) -> AsyncGenerator[str, None]:
-    """
-    Stream Claude response and yield complete sentences as they arrive.
-    This allows TTS to start on sentence 1 while sentence 2 is still generating.
-    """
-    system = build_system_prompt(name, companion_type, personalities, description, language)
-    messages = conversation_history[-16:] + [{"role": "user", "content": user_message}]
+{memory_ctx}
 
-    buffer = ""
-    full_response = ""
+{personality_ctx}
 
-    async with client.messages.stream(
-        model=settings.CLAUDE_MODEL,
-        max_tokens=100,
-        system=system,
-        messages=messages
-    ) as stream:
-        async for chunk in stream.text_stream:
-            buffer += chunk
-            full_response += chunk
+USE MEMORIES NATURALLY: Don't recite facts. If relevant, weave them in naturally like "Oh, how's that startup thing going?" or "Still dealing with that back pain?"
+"""
 
-            # Split on sentence endings (Hindi: ।, English: . ! ?)
-            parts = re.split(r'(?<=[।.!?])\s+', buffer)
-            while len(parts) > 1:
-                sentence = strip_for_tts(parts[0].strip())
-                if sentence:
-                    yield sentence
-                parts = parts[1:]
-            buffer = parts[0] if parts else ""
-
-    # Yield any remaining text
-    if buffer.strip():
-        remaining = strip_for_tts(buffer.strip())
-        if remaining:
-            yield remaining
-
-# Full response for history tracking
 async def get_ai_response(name, companion_type, personalities, description, language,
-                          conversation_history, user_message) -> str:
-    system = build_system_prompt(name, companion_type, personalities, description, language)
+                          conversation_history, user_message,
+                          memory_bank=None, interaction_style=None, user_name=None) -> str:
+    system = build_system_prompt(name, companion_type, personalities, description, language,
+                                  memory_bank, interaction_style, user_name)
     messages = conversation_history[-16:] + [{"role": "user", "content": user_message}]
     response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
@@ -119,25 +96,38 @@ async def get_ai_response(name, companion_type, personalities, description, lang
     )
     return strip_for_tts(response.content[0].text)
 
-def get_call_opener(name, companion_type, personalities, language):
+def get_call_opener(name, companion_type, personalities, language, user_name=None, memory_bank=None):
     import random
+    
+    greeting = user_name.split()[0] if user_name else ""
+    
     if language == "hi":
-        openers = [
-            f"हाँ बोलो, मैं {name} हूँ। कैसे हो?",
-            f"हेलो! मैं {name} बोल रहा हूँ। क्या हाल है?",
-        ]
-        if "flirty" in personalities:
-            openers = [f"हेलो! मैं {name} हूँ। उठा लिया फोन, अच्छा किया।"]
-    elif language in ("es", "fr", "de"):
-        openers = [f"Hola, soy {name}. ¿Cómo estás?"] if language == "es" else \
-                  [f"Allô, c'est {name}. Comment tu vas?"] if language == "fr" else \
-                  [f"Hallo, ich bin {name}. Wie geht's dir?"]
+        if greeting:
+            openers = [
+                f"Haan {greeting}! Main {name} bol rahi hoon. Kaise ho?",
+                f"Hey {greeting}! Main {name} hoon. Kya haal hai?",
+            ]
+        else:
+            openers = [
+                f"Haan! Main {name} bol rahi hoon. Kaise ho aap?",
+                f"Hello! {name} here. Sab theek hai?",
+            ]
     else:
-        openers = [
-            f"Hey! It's {name}. How are you doing?",
-            f"Hi! {name} here. So glad you picked up.",
-        ]
-        if "flirty" in personalities:
-            openers = [f"Well, you picked up. I'm {name}. How are you?"]
+        if greeting:
+            openers = [
+                f"Hey {greeting}! It's {name}. How are you doing?",
+                f"Hi {greeting}! {name} here. What's up?",
+            ]
+        else:
+            openers = [
+                f"Hey! It's {name}. How are you doing?",
+                f"Hi! {name} here. How's your day going?",
+            ]
+
+    if "flirty" in personalities:
+        if greeting:
+            openers = [f"Well, {greeting} actually picked up. I'm {name}. How are you?"]
+        else:
+            openers = [f"Well, you actually picked up. I'm {name}. How are you?"]
 
     return random.choice(openers)

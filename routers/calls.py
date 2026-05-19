@@ -6,12 +6,15 @@ from datetime import datetime, timezone
 import json, asyncio, base64, logging, traceback, httpx, time
 
 from database import get_db
-from models import Companion, CallSession, User
+from models import Companion, CallSession, User, UserProfile, UserCredits
 from schemas import InitiateCallRequest, InitiateCallResponse, CallStatusResponse
 from auth_utils import get_optional_user
 from services.plivo_service import initiate_outbound_call, build_hangup_xml
 from services.ai_service import get_ai_response, get_call_opener
 from services.voice_service import text_to_speech_mp3, select_voice
+from services.memory_service import extract_memories_from_transcript, merge_memories
+from routers.credits import get_or_create_credits, deduct_credits_for_call, CREDITS_PER_MINUTE
+from routers.profile import get_or_create_profile
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,7 @@ async def initiate_call(
     if not phone.startswith("+"):
         phone = "+91" + phone
 
+    # Check free call eligibility for guests
     if not user and phone not in BYPASS_NUMBERS:
         result = await db.execute(
             select(CallSession).where(
@@ -43,14 +47,45 @@ async def initiate_call(
         if len(result.scalars().all()) >= 1:
             raise HTTPException(403, "Free call already used. Please create an account.")
 
-    voice_id = select_voice(body.companion_type, body.personalities)
+    # Check credits for logged-in users
+    memory_bank = {}
+    interaction_style = {}
+    user_name = None
+
+    if user:
+        credits = await get_or_create_credits(user.id, db)
+        profile = await get_or_create_profile(user, db)
+        
+        if credits.balance < CREDITS_PER_MINUTE and phone not in BYPASS_NUMBERS:
+            raise HTTPException(402, "Insufficient credits. Please top up to continue.")
+
+        memory_bank = profile.memory_bank or {}
+        interaction_style = profile.interaction_style or {}
+        user_name = profile.first_name or user.name
+
+        # Use profile companion config if no custom one provided
+        voice_id = select_voice(
+            profile.companion_type or body.companion_type,
+            profile.companion_personalities or body.personalities
+        )
+        companion_name = profile.companion_name or body.companion_name
+        companion_type = profile.companion_type or body.companion_type
+        personalities = profile.companion_personalities or body.personalities
+        language = profile.companion_language or body.language
+    else:
+        voice_id = select_voice(body.companion_type, body.personalities)
+        companion_name = body.companion_name
+        companion_type = body.companion_type
+        personalities = body.personalities
+        language = body.language
+
     companion = Companion(
         user_id=user.id if user else None,
-        name=body.companion_name,
-        companion_type=body.companion_type,
-        personalities=body.personalities,
+        name=companion_name,
+        companion_type=companion_type,
+        personalities=personalities,
         description=body.description,
-        language=body.language,
+        language=language,
         voice_id=voice_id,
     )
     db.add(companion)
@@ -59,7 +94,7 @@ async def initiate_call(
     session = CallSession(
         companion_id=companion.id,
         caller_phone=phone,
-        is_free_call=(user is None or user.plan == "free"),
+        is_free_call=(user is None or user.plan == "free") and phone not in BYPASS_NUMBERS,
         status="initiated"
     )
     db.add(session)
@@ -74,10 +109,13 @@ async def initiate_call(
             "language": companion.language,
             "voice_id": voice_id,
         },
+        "user_id": user.id if user else None,
+        "user_name": user_name,
+        "memory_bank": memory_bank,
+        "interaction_style": interaction_style,
         "history": [],
         "duration": 0,
-        "is_free": session.is_free_call and phone not in BYPASS_NUMBERS,
-        "opener": None,
+        "is_free": session.is_free_call,
         "call_uuid": None,
         "mute_until": 0.0,
     }
@@ -112,7 +150,6 @@ async def serve_audio(session_id: str, index: int):
 
 async def play_on_call(session_id: str, call_uuid: str, text: str,
                        voice_id: str, call_state: dict) -> float:
-    """Generate TTS and play via Plivo REST. Returns duration seconds."""
     try:
         audio = await text_to_speech_mp3(text, voice_id)
         idx = audio_counter.get(session_id, 0)
@@ -121,8 +158,6 @@ async def play_on_call(session_id: str, call_uuid: str, text: str,
         audio_cache[key] = audio
         audio_url = f"https://callmybae-backend.onrender.com/api/calls/audio/{session_id}/{idx}"
         duration = len(audio) / 16000 + 0.5
-
-        # Mute Deepgram for duration so AI doesn't hear itself
         call_state["mute_until"] = time.time() + duration
 
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -132,7 +167,6 @@ async def play_on_call(session_id: str, call_uuid: str, text: str,
                 json={"urls": audio_url, "length": 300}
             )
             logger.info(f"Play {resp.status_code}")
-
         return duration
     except Exception as e:
         logger.error(f"play_on_call error: {e}")
@@ -155,6 +189,8 @@ async def plivo_answer(session_id: str, db: AsyncSession = Depends(get_db)):
         companion.get("type", "her"),
         companion.get("personalities", []),
         companion.get("language", "en"),
+        user_name=call_state.get("user_name"),
+        memory_bank=call_state.get("memory_bank"),
     )
     call_state["opener"] = opener
 
@@ -178,16 +214,48 @@ async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Dep
         call_state = active_calls.pop(session_id, {})
         session.duration_secs = int(call_state.get("duration", 0))
         session.transcript = call_state.get("history", [])
+
+        # Deduct credits for logged-in users
+        user_id = call_state.get("user_id")
+        if user_id and session.duration_secs > 0:
+            try:
+                credits_used = await deduct_credits_for_call(
+                    user_id, session.duration_secs, session.id, db
+                )
+                session.credits_used = credits_used
+            except Exception as e:
+                logger.error(f"Credit deduction error: {e}")
+
+        # Extract and save memories
+        if user_id and session.transcript:
+            try:
+                profile_result = await db.execute(
+                    select(UserProfile).where(UserProfile.user_id == user_id)
+                )
+                profile = profile_result.scalar_one_or_none()
+                if profile:
+                    new_memories = await extract_memories_from_transcript(session.transcript)
+                    if new_memories:
+                        profile.memory_bank = merge_memories(profile.memory_bank or {}, new_memories)
+                    # Update stats
+                    profile.total_call_minutes = (profile.total_call_minutes or 0) + session.duration_secs / 60
+                    profile.last_call_at = datetime.now(timezone.utc)
+                    # Update interaction style
+                    style = profile.interaction_style or {}
+                    style["call_count"] = style.get("call_count", 0) + 1
+                    profile.interaction_style = style
+            except Exception as e:
+                logger.error(f"Memory save error: {e}")
+
         await db.flush()
+
     for k in [k for k in audio_cache if k.startswith(session_id)]:
         del audio_cache[k]
     return {"ok": True}
 
 
-
 @router.post("/recording/{session_id}")
 async def plivo_recording(session_id: str, request: Request, db: AsyncSession = Depends(get_db)):
-    """Plivo calls this when recording is ready."""
     try:
         form = await request.form()
         recording_url = form.get("RecordUrl") or form.get("recording_url", "")
@@ -197,7 +265,6 @@ async def plivo_recording(session_id: str, request: Request, db: AsyncSession = 
             if session:
                 session.recording_url = recording_url
                 await db.flush()
-                logger.info(f"Recording saved: {recording_url}")
     except Exception as e:
         logger.error(f"Recording webhook error: {e}")
     return {"ok": True}
@@ -220,8 +287,6 @@ async def call_status(session_id: str, db: AsyncSession = Depends(get_db)):
 @router.websocket("/ws/{session_id}")
 async def call_websocket(websocket: WebSocket, session_id: str):
     await websocket.accept()
-    print(f"WS: {session_id}", flush=True)
-
     call_state = active_calls.get(session_id)
     if not call_state:
         await websocket.close(code=1008)
@@ -245,7 +310,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         async def on_transcript(self, result, **kwargs):
             try:
                 if time.time() < call_state.get("mute_until", 0):
-                    return  # AI speaking, ignore
+                    return
                 text = result.channel.alternatives[0].transcript.strip()
                 if not text or not ws_open:
                     return
@@ -304,26 +369,23 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             ai_text = await get_ai_response(
                 companion["name"], companion["type"], companion["personalities"],
                 companion["description"], companion["language"],
-                call_state["history"], user_text
+                call_state["history"], user_text,
+                memory_bank=call_state.get("memory_bank"),
+                interaction_style=call_state.get("interaction_style"),
+                user_name=call_state.get("user_name"),
             )
             logger.info(f"AI: '{ai_text}'")
             call_state["history"].append({"role": "assistant", "content": ai_text})
 
             call_uuid = call_state.get("call_uuid")
             if call_uuid:
-                duration = await play_on_call(
-                    session_id, call_uuid, ai_text,
-                    companion["voice_id"], call_state
-                )
-                logger.info(f"Playing for {duration:.1f}s")
+                duration = await play_on_call(session_id, call_uuid, ai_text, companion["voice_id"], call_state)
+                logger.info(f"Playing {duration:.1f}s")
 
-            if call_state["is_free"] and call_state["duration"] >= settings.FREE_CALL_LIMIT_SECONDS:
-                farewell = {
-                    "hi": "यार फ्री टाइम खत्म हो गया। अकाउंट बनाओ और फिर बात करते हैं।",
-                    "en": "Our free time is up. Create an account and we can talk anytime. Bye!"
-                }.get(companion["language"], "Our free time is up. Bye!")
-                if call_uuid:
-                    await play_on_call(session_id, call_uuid, farewell, companion["voice_id"], call_state)
+            # Credit check — warn user at low balance
+            user_id = call_state.get("user_id")
+            if user_id and call_state["duration"] > 0:
+                pass  # Credits deducted at hangup
 
         except Exception as e:
             logger.error(f"Response error: {e}\n{traceback.format_exc()}")
@@ -348,13 +410,11 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                     )
                     if plivo_call_id:
                         call_state["call_uuid"] = plivo_call_id
-                    logger.info(f"STREAM START | {call_state.get('call_uuid')}")
+                    logger.info(f"STREAM START")
 
                     if not opener_played:
                         opener_played = True
-                        opener_text = call_state.get("opener") or \
-                            f"Hey, it's {companion['name']}. How are you?"
-                        # Mute BEFORE creating task so barge-in doesn't fire during opener
+                        opener_text = call_state.get("opener") or f"Hey, it's {companion['name']}. How are you?"
                         opener_est = len(opener_text) * 0.07 + 3.0
                         call_state["mute_until"] = time.time() + opener_est
                         asyncio.create_task(
@@ -370,7 +430,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                         await dg_connection.send(chunk)
 
                 elif event == "stop":
-                    pass  # ignore, Plivo sends this after Play finishes
+                    pass
 
             except json.JSONDecodeError:
                 pass
@@ -378,7 +438,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 logger.error(f"Loop error: {e}")
 
     except WebSocketDisconnect:
-        logger.info("Call ended")
+        pass
     except Exception as e:
         logger.error(f"WS error: {e}")
     finally:
@@ -388,4 +448,3 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 await dg_connection.finish()
             except Exception:
                 pass
-        logger.info(f"WS closed: {session_id}")
