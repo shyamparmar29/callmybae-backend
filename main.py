@@ -4,16 +4,10 @@ from contextlib import asynccontextmanager
 import uvicorn
 import logging
 
-# Force all loggers to show INFO
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
-logging.getLogger("routers.calls").setLevel(logging.DEBUG)
-logging.getLogger("services").setLevel(logging.DEBUG)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 from database import create_tables
-from routers import auth, companions, calls, payments
+from routers import auth, companions, calls, payments, whatsapp, admin
 from config import settings
 
 @asynccontextmanager
@@ -21,15 +15,16 @@ async def lifespan(app: FastAPI):
     await create_tables()
     yield
 
-app = FastAPI(
-    title="CallMyBae API",
-    version="1.0.0",
-    lifespan=lifespan
-)
+app = FastAPI(title="CallMyBae API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://callmybae.com", "https://www.callmybae.com", "http://localhost:3000"],
+    allow_origins=[
+        "https://callmybae.com",
+        "https://www.callmybae.com",
+        "http://localhost:3000",
+        "http://localhost:8080",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,10 +34,12 @@ app.include_router(auth.router,       prefix="/api/auth",       tags=["auth"])
 app.include_router(companions.router, prefix="/api/companions",  tags=["companions"])
 app.include_router(calls.router,      prefix="/api/calls",       tags=["calls"])
 app.include_router(payments.router,   prefix="/api/payments",    tags=["payments"])
+app.include_router(whatsapp.router,   prefix="/api/whatsapp",    tags=["whatsapp"])
+app.include_router(admin.router,      prefix="/api/admin",       tags=["admin"])
 
 @app.get("/")
 async def root():
-    return {"status": "CallMyBae API running", "version": "1.0.0"}
+    return {"status": "CallMyBae API", "version": "1.0.0"}
 
 @app.get("/health")
 async def health():

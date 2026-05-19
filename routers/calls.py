@@ -184,6 +184,25 @@ async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Dep
     return {"ok": True}
 
 
+
+@router.post("/recording/{session_id}")
+async def plivo_recording(session_id: str, request: Request, db: AsyncSession = Depends(get_db)):
+    """Plivo calls this when recording is ready."""
+    try:
+        form = await request.form()
+        recording_url = form.get("RecordUrl") or form.get("recording_url", "")
+        if recording_url:
+            result = await db.execute(select(CallSession).where(CallSession.id == session_id))
+            session = result.scalar_one_or_none()
+            if session:
+                session.recording_url = recording_url
+                await db.flush()
+                logger.info(f"Recording saved: {recording_url}")
+    except Exception as e:
+        logger.error(f"Recording webhook error: {e}")
+    return {"ok": True}
+
+
 @router.get("/status/{session_id}", response_model=CallStatusResponse)
 async def call_status(session_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(CallSession).where(CallSession.id == session_id))
