@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime, timezone
-import json, asyncio, base64, logging, traceback
+import json, asyncio, base64, logging, traceback, httpx, io
 
 from database import get_db
 from models import Companion, CallSession, User
@@ -11,7 +11,7 @@ from schemas import InitiateCallRequest, InitiateCallResponse, CallStatusRespons
 from auth_utils import get_optional_user
 from services.plivo_service import initiate_outbound_call, build_hangup_xml
 from services.ai_service import get_ai_response, get_call_opener
-from services.voice_service import text_to_speech_mulaw, select_voice
+from services.voice_service import text_to_speech_mp3, select_voice
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -19,6 +19,10 @@ router = APIRouter()
 active_calls: dict[str, dict] = {}
 
 BYPASS_NUMBERS = ["+919601971754", "+918849798063"]
+
+# Cache audio files in memory keyed by session+index
+audio_cache: dict[str, bytes] = {}
+audio_counter: dict[str, int] = {}
 
 
 @router.post("/initiate", response_model=InitiateCallResponse)
@@ -41,9 +45,7 @@ async def initiate_call(
         if len(result.scalars().all()) >= 1:
             raise HTTPException(403, "Free call already used. Please create an account.")
 
-    # Smart voice selection based on type + personalities
     voice_id = select_voice(body.companion_type, body.personalities)
-
     companion = Companion(
         user_id=user.id if user else None,
         name=body.companion_name,
@@ -78,14 +80,17 @@ async def initiate_call(
         "duration": 0,
         "is_free": session.is_free_call and phone not in BYPASS_NUMBERS,
         "opener": None,
+        "call_uuid": None,
     }
+    audio_counter[session.id] = 0
 
     try:
         plivo_uuid = initiate_outbound_call(phone, session.id)
         session.plivo_call_uuid = plivo_uuid
+        active_calls[session.id]["call_uuid"] = plivo_uuid
         session.status = "ringing"
     except Exception as e:
-        logger.error(f"Plivo call failed: {e}")
+        logger.error(f"Plivo failed: {e}")
         raise HTTPException(500, f"Plivo call failed: {str(e)}")
 
     await db.flush()
@@ -95,6 +100,47 @@ async def initiate_call(
         status=session.status,
         message=f"Calling {phone} now!"
     )
+
+
+@router.get("/audio/{session_id}/{index}")
+async def serve_audio(session_id: str, index: int):
+    """Serve cached MP3 audio to Plivo via URL."""
+    key = f"{session_id}_{index}"
+    audio = audio_cache.get(key)
+    if not audio:
+        raise HTTPException(404, "Audio not found")
+    return Response(content=audio, media_type="audio/mpeg")
+
+
+async def play_audio_via_api(session_id: str, call_uuid: str, text: str, voice_id: str):
+    """
+    Generate MP3 with ElevenLabs, cache it, then tell Plivo to play it
+    via the REST API speak action — this is the correct way to inject
+    audio mid-call without WebSocket streaming issues.
+    """
+    try:
+        logger.info(f"Generating TTS for: '{text[:60]}'")
+        audio = await text_to_speech_mp3(text, voice_id)
+
+        idx = audio_counter.get(session_id, 0)
+        audio_counter[session_id] = idx + 1
+        key = f"{session_id}_{idx}"
+        audio_cache[key] = audio
+
+        audio_url = f"https://callmybae-backend.onrender.com/api/calls/audio/{session_id}/{idx}"
+        logger.info(f"Audio URL: {audio_url} ({len(audio)} bytes)")
+
+        # Tell Plivo to play the audio into the live call
+        import plivo
+        client = plivo.RestClient(settings.PLIVO_AUTH_ID, settings.PLIVO_AUTH_TOKEN)
+        client.calls.play(
+            call_uuid,
+            urls=audio_url,
+        )
+        logger.info(f"Plivo play triggered ✓")
+
+    except Exception as e:
+        logger.error(f"play_audio_via_api error: {e}\n{traceback.format_exc()}")
 
 
 @router.get("/answer/{session_id}")
@@ -117,7 +163,7 @@ async def plivo_answer(session_id: str, db: AsyncSession = Depends(get_db)):
         companion.get("language", "en"),
     )
     call_state["opener"] = opener
-    logger.info(f"Answer webhook: opener='{opener[:60]}...'")
+    logger.info(f"Answer: opener set, len={len(opener)}")
 
     ws_url = f"wss://callmybae-backend.onrender.com/api/calls/ws/{session_id}"
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -140,6 +186,10 @@ async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Dep
         session.duration_secs = int(call_state.get("duration", 0))
         session.transcript = call_state.get("history", [])
         await db.flush()
+    # Clean up audio cache
+    keys = [k for k in audio_cache if k.startswith(session_id)]
+    for k in keys:
+        del audio_cache[k]
     return {"ok": True}
 
 
@@ -157,25 +207,6 @@ async def call_status(session_id: str, db: AsyncSession = Depends(get_db)):
     )
 
 
-async def _send_audio(websocket: WebSocket, mulaw_bytes: bytes):
-    """Send mulaw audio to Plivo in 20ms chunks."""
-    chunk_size = 320
-    for i in range(0, len(mulaw_bytes), chunk_size):
-        chunk = mulaw_bytes[i:i + chunk_size]
-        try:
-            await websocket.send_json({
-                "event": "playAudio",
-                "media": {
-                    "contentType": "audio/x-mulaw",
-                    "sampleRate": 8000,
-                    "payload": base64.b64encode(chunk).decode()
-                }
-            })
-        except Exception:
-            return  # WebSocket closed, stop sending
-        await asyncio.sleep(0.018)
-
-
 @router.websocket("/ws/{session_id}")
 async def call_websocket(websocket: WebSocket, session_id: str):
     await websocket.accept()
@@ -184,19 +215,17 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
     call_state = active_calls.get(session_id)
     if not call_state:
-        logger.error(f"No call state for {session_id}")
+        logger.error(f"No call state: {session_id}")
         await websocket.close(code=1008)
         return
 
     companion = call_state["companion"]
-    logger.info(f"Companion: {companion['name']} | voice: {companion['voice_id']}")
-
     dg_connection = None
     transcript_parts: list[str] = []
     is_processing = False
     ws_open = True
 
-    # ── Setup Deepgram ──
+    # Setup Deepgram
     try:
         logger.info("Connecting Deepgram...")
         from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
@@ -231,9 +260,9 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         dg_connection.on(LiveTranscriptionEvents.Error, on_error)
         dg_connection.on(LiveTranscriptionEvents.Close, on_close)
 
-        # Tell Deepgram we're sending mulaw 8kHz
-        lang = "hi" if companion["language"] == "hi" else \
-               companion["language"] if len(companion["language"]) == 2 else "en"
+        lang = companion["language"]
+        if len(lang) > 2:
+            lang = "en"
 
         started = await dg_connection.start(LiveOptions(
             model="nova-2",
@@ -245,15 +274,14 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             interim_results=True,
         ))
         logger.info(f"Deepgram start: {started}")
-
         try:
             await asyncio.wait_for(dg_ready.wait(), timeout=8.0)
             logger.info("=== DEEPGRAM READY ===")
         except asyncio.TimeoutError:
-            logger.warning("Deepgram ready timeout — continuing")
+            logger.warning("Deepgram timeout")
 
     except Exception as e:
-        logger.error(f"Deepgram FAILED: {e}\n{traceback.format_exc()}")
+        logger.error(f"Deepgram setup failed: {e}\n{traceback.format_exc()}")
         dg_connection = None
 
     async def maybe_respond():
@@ -273,15 +301,18 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             )
             logger.info(f"=== AI: '{ai_text}' ===")
             call_state["history"].append({"role": "assistant", "content": ai_text})
-            mulaw = await text_to_speech_mulaw(ai_text, companion["voice_id"])
-            logger.info(f"TTS: {len(mulaw)} bytes")
-            await _send_audio(websocket, mulaw)
+
+            call_uuid = call_state.get("call_uuid")
+            if call_uuid:
+                await play_audio_via_api(session_id, call_uuid, ai_text, companion["voice_id"])
+            else:
+                logger.error("No call_uuid in call_state!")
 
             if call_state["is_free"] and call_state["duration"] >= settings.FREE_CALL_LIMIT_SECONDS:
                 farewell = "I have loved talking with you! Our free time is up. Create an account and we can talk whenever you want. Bye!"
-                f_mulaw = await text_to_speech_mulaw(farewell, companion["voice_id"])
-                await _send_audio(websocket, f_mulaw)
-                await asyncio.sleep(6)
+                if call_uuid:
+                    await play_audio_via_api(session_id, call_uuid, farewell, companion["voice_id"])
+                await asyncio.sleep(10)
                 try:
                     await websocket.close()
                 except Exception:
@@ -291,7 +322,8 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         finally:
             is_processing = False
 
-    # ── Main loop ──
+    opener_played = False
+
     try:
         async for raw_msg in websocket.iter_text():
             try:
@@ -299,20 +331,26 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 event = msg.get("event", "")
 
                 if event == "start":
-                    logger.info("=== STREAM START — playing opener ===")
-                    # AWAIT directly — don't use create_task
-                    # This blocks the loop briefly but that's fine,
-                    # Plivo buffers incoming audio while we play the opener
-                    opener_text = call_state.get("opener") or \
-                        f"Hey! This is {companion['name']}. So happy you picked up! How are you doing?"
-                    logger.info(f"Opener: '{opener_text}'")
-                    try:
-                        mulaw = await text_to_speech_mulaw(opener_text, companion["voice_id"])
-                        logger.info(f"Opener TTS: {len(mulaw)} bytes — sending...")
-                        await _send_audio(websocket, mulaw)
-                        logger.info("Opener sent ✓")
-                    except Exception as e:
-                        logger.error(f"Opener TTS failed: {e}\n{traceback.format_exc()}")
+                    logger.info("=== STREAM START ===")
+                    # Store the call UUID from Plivo start event
+                    start_data = msg.get("start", {})
+                    call_uuid_from_plivo = start_data.get("callId", "") or start_data.get("call_uuid", "")
+                    if call_uuid_from_plivo:
+                        call_state["call_uuid"] = call_uuid_from_plivo
+                        logger.info(f"Got call_uuid from start: {call_uuid_from_plivo}")
+
+                    if not opener_played:
+                        opener_played = True
+                        opener_text = call_state.get("opener") or \
+                            f"Hey! This is {companion['name']}. So happy you picked up! How are you?"
+                        call_uuid = call_state.get("call_uuid")
+                        logger.info(f"Playing opener via API: call_uuid={call_uuid}")
+                        if call_uuid:
+                            asyncio.create_task(
+                                play_audio_via_api(session_id, call_uuid, opener_text, companion["voice_id"])
+                            )
+                        else:
+                            logger.error("No call_uuid yet for opener!")
 
                 elif event == "media":
                     payload = msg.get("media", {}).get("payload", "")

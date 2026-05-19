@@ -82,3 +82,27 @@ async def text_to_speech(text: str, voice_id: str) -> bytes:
 
 def get_voice_for_companion(companion_type: str) -> str:
     return VOICES.get(companion_type, VOICES["her"])["default"]["id"]
+
+async def text_to_speech_mp3(text: str, voice_id: str) -> bytes:
+    """MP3 for Plivo play URL — highest compatibility."""
+    url = f"{ELEVENLABS_BASE}/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": settings.ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg"
+    }
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "output_format": "mp3_44100_128",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.8,
+            "style": 0.2,
+            "use_speaker_boost": True
+        }
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        return response.content
