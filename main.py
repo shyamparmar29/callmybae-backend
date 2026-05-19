@@ -2,6 +2,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import uvicorn
+import logging
+
+# Force all loggers to show INFO
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+logging.getLogger("routers.calls").setLevel(logging.DEBUG)
+logging.getLogger("services").setLevel(logging.DEBUG)
 
 from database import create_tables
 from routers import auth, companions, calls, payments

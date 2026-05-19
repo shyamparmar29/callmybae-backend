@@ -179,6 +179,7 @@ async def _send_audio(websocket: WebSocket, mulaw_bytes: bytes):
 @router.websocket("/ws/{session_id}")
 async def call_websocket(websocket: WebSocket, session_id: str):
     await websocket.accept()
+    print(f"WS HANDLER REACHED: {session_id}", flush=True)
     logger.info(f"=== WS OPEN: {session_id} ===")
 
     call_state = active_calls.get(session_id)
