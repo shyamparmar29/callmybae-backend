@@ -5,7 +5,7 @@ from config import settings
 from services.memory_service import build_memory_context, build_personality_evolution_context
 
 logger = logging.getLogger(__name__)
-client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY, max_retries=4)
 
 PERSONALITY_PROMPTS = {
     "warm":        "deeply nurturing and caring, emotionally supportive",
@@ -82,19 +82,36 @@ Your character: {traits}.{custom}
 USE MEMORIES NATURALLY: Don't recite facts. If relevant, weave them in naturally like "Oh, how's that startup thing going?" or "Still dealing with that back pain?"
 """
 
+FALLBACKS_HI = [
+    "Haan yaar, main sun raha hoon. Bolo kya hua?",
+    "Ek second, kuch connectivity issue lag raha hai. Tum kya keh rahe the?",
+    "Sorry yaar, ek baar phir bologe? Main poora sun raha hoon.",
+]
+FALLBACKS_EN = [
+    "Hey, I'm here. Tell me more.",
+    "Sorry, one sec — say that again?",
+    "I'm listening, go on.",
+]
+
 async def get_ai_response(name, companion_type, personalities, description, language,
                           conversation_history, user_message,
                           memory_bank=None, interaction_style=None, user_name=None) -> str:
+    import random
     system = build_system_prompt(name, companion_type, personalities, description, language,
                                   memory_bank, interaction_style, user_name)
     messages = conversation_history[-16:] + [{"role": "user", "content": user_message}]
-    response = await client.messages.create(
-        model=settings.CLAUDE_MODEL,
-        max_tokens=180,
-        system=system,
-        messages=messages
-    )
-    return strip_for_tts(response.content[0].text)
+    try:
+        response = await client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=180,
+            system=system,
+            messages=messages
+        )
+        return strip_for_tts(response.content[0].text)
+    except Exception as e:
+        logger.error(f"Claude API error (using fallback): {e}")
+        fallbacks = FALLBACKS_HI if language == "hi" else FALLBACKS_EN
+        return random.choice(fallbacks)
 
 def get_call_opener(name, companion_type, personalities, language, user_name=None, memory_bank=None):
     import random
