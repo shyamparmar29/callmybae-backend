@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json, asyncio, base64, logging, traceback, httpx, time
 
 from database import get_db
-from models import Companion, CallSession, User, UserProfile, UserCredits
+from models import Companion, CallSession, User, UserProfile
 from schemas import InitiateCallRequest, InitiateCallResponse, CallStatusResponse
 from auth_utils import get_optional_user
 from services.plivo_service import initiate_outbound_call, build_hangup_xml, start_recording
@@ -36,7 +36,6 @@ async def initiate_call(
     if not phone.startswith("+"):
         phone = "+91" + phone
 
-    # Check free call eligibility for guests
     if not user and phone not in BYPASS_NUMBERS:
         result = await db.execute(
             select(CallSession).where(
@@ -47,23 +46,19 @@ async def initiate_call(
         if len(result.scalars().all()) >= 1:
             raise HTTPException(403, "Free call already used. Please create an account.")
 
-    # Check credits for logged-in users
     memory_bank = {}
     interaction_style = {}
     user_name = None
+    description = body.description
 
     if user:
         credits = await get_or_create_credits(user.id, db)
         profile = await get_or_create_profile(user, db)
-        
         if credits.balance < CREDITS_PER_MINUTE and phone not in BYPASS_NUMBERS:
             raise HTTPException(402, "Insufficient credits. Please top up to continue.")
-
         memory_bank = profile.memory_bank or {}
         interaction_style = profile.interaction_style or {}
         user_name = profile.first_name or user.name
-
-        # Use profile companion config if no custom one provided
         voice_id = select_voice(
             profile.companion_type or body.companion_type,
             profile.companion_personalities or body.personalities
@@ -79,23 +74,18 @@ async def initiate_call(
         companion_type = body.companion_type
         personalities = body.personalities
         language = body.language
-        description = body.description
 
     companion = Companion(
         user_id=user.id if user else None,
-        name=companion_name,
-        companion_type=companion_type,
-        personalities=personalities,
-        description=description if user else body.description,
-        language=language,
-        voice_id=voice_id,
+        name=companion_name, companion_type=companion_type,
+        personalities=personalities, description=description,
+        language=language, voice_id=voice_id,
     )
     db.add(companion)
     await db.flush()
 
     session = CallSession(
-        companion_id=companion.id,
-        caller_phone=phone,
+        companion_id=companion.id, caller_phone=phone,
         is_free_call=(user is None) and phone not in BYPASS_NUMBERS,
         status="initiated"
     )
@@ -104,12 +94,9 @@ async def initiate_call(
 
     active_calls[session.id] = {
         "companion": {
-            "name": companion.name,
-            "type": companion.companion_type,
-            "personalities": companion.personalities,
-            "description": companion.description,
-            "language": companion.language,
-            "voice_id": voice_id,
+            "name": companion.name, "type": companion.companion_type,
+            "personalities": companion.personalities, "description": companion.description,
+            "language": companion.language, "voice_id": voice_id,
         },
         "user_id": user.id if user else None,
         "user_name": user_name,
@@ -120,6 +107,10 @@ async def initiate_call(
         "is_free": session.is_free_call,
         "call_uuid": None,
         "mute_until": 0.0,
+        # Latest-intent tracking
+        "latest_text": "",
+        "latest_ts": 0.0,
+        "respond_task": None,
     }
     audio_counter[session.id] = 0
 
@@ -134,10 +125,8 @@ async def initiate_call(
 
     await db.flush()
     return InitiateCallResponse(
-        call_session_id=session.id,
-        companion_id=companion.id,
-        status=session.status,
-        message=f"Calling {phone} now!"
+        call_session_id=session.id, companion_id=companion.id,
+        status=session.status, message=f"Calling {phone} now!"
     )
 
 
@@ -182,22 +171,19 @@ async def plivo_answer(session_id: str, db: AsyncSession = Depends(get_db)):
     if not session:
         return PlainTextResponse(build_hangup_xml(), media_type="application/xml")
     session.status = "connected"
-    # Start recording this call
-    call_uuid_from_params = session.plivo_call_uuid or ""
-    if call_uuid_from_params:
+
+    if session.plivo_call_uuid:
         recording_cb = f"https://callmybae-backend.onrender.com/api/calls/recording/{session_id}"
-        asyncio.create_task(asyncio.to_thread(start_recording, call_uuid_from_params, recording_cb))
+        asyncio.create_task(asyncio.to_thread(start_recording, session.plivo_call_uuid, recording_cb))
+
     await db.flush()
 
     call_state = active_calls.get(session_id, {})
     companion = call_state.get("companion", {})
     opener = get_call_opener(
-        companion.get("name", "Luna"),
-        companion.get("type", "her"),
-        companion.get("personalities", []),
-        companion.get("language", "en"),
-        user_name=call_state.get("user_name"),
-        memory_bank=call_state.get("memory_bank"),
+        companion.get("name", "Luna"), companion.get("type", "her"),
+        companion.get("personalities", []), companion.get("language", "en"),
+        user_name=call_state.get("user_name"), memory_bank=call_state.get("memory_bank"),
     )
     call_state["opener"] = opener
 
@@ -219,35 +205,31 @@ async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Dep
         session.status = "ended"
         session.ended_at = datetime.now(timezone.utc)
         call_state = active_calls.pop(session_id, {})
+        # Cancel any pending response task
+        task = call_state.get("respond_task")
+        if task and not task.done():
+            task.cancel()
         session.duration_secs = int(call_state.get("duration", 0))
         session.transcript = call_state.get("history", [])
 
-        # Deduct credits for logged-in users
         user_id = call_state.get("user_id")
         if user_id and session.duration_secs > 0:
             try:
-                credits_used = await deduct_credits_for_call(
-                    user_id, session.duration_secs, session.id, db
-                )
+                credits_used = await deduct_credits_for_call(user_id, session.duration_secs, session.id, db)
                 session.credits_used = credits_used
             except Exception as e:
                 logger.error(f"Credit deduction error: {e}")
 
-        # Extract and save memories
         if user_id and session.transcript:
             try:
-                profile_result = await db.execute(
-                    select(UserProfile).where(UserProfile.user_id == user_id)
-                )
+                profile_result = await db.execute(select(UserProfile).where(UserProfile.user_id == user_id))
                 profile = profile_result.scalar_one_or_none()
                 if profile:
                     new_memories = await extract_memories_from_transcript(session.transcript)
                     if new_memories:
                         profile.memory_bank = merge_memories(profile.memory_bank or {}, new_memories)
-                    # Update stats
                     profile.total_call_minutes = (profile.total_call_minutes or 0) + session.duration_secs / 60
                     profile.last_call_at = datetime.now(timezone.utc)
-                    # Update interaction style
                     style = profile.interaction_style or {}
                     style["call_count"] = style.get("call_count", 0) + 1
                     profile.interaction_style = style
@@ -255,7 +237,6 @@ async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Dep
                 logger.error(f"Memory save error: {e}")
 
         await db.flush()
-
     for k in [k for k in audio_cache if k.startswith(session_id)]:
         del audio_cache[k]
     return {"ok": True}
@@ -284,10 +265,8 @@ async def call_status(session_id: str, db: AsyncSession = Depends(get_db)):
     if not session:
         raise HTTPException(404, "Call session not found")
     return CallStatusResponse(
-        call_session_id=session.id,
-        status=session.status,
-        duration_secs=session.duration_secs,
-        is_free_call=session.is_free_call,
+        call_session_id=session.id, status=session.status,
+        duration_secs=session.duration_secs, is_free_call=session.is_free_call,
     )
 
 
@@ -301,8 +280,6 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
     companion = call_state["companion"]
     dg_connection = None
-    transcript_parts: list[str] = []
-    is_processing = False
     ws_open = True
 
     try:
@@ -316,15 +293,32 @@ async def call_websocket(websocket: WebSocket, session_id: str):
 
         async def on_transcript(self, result, **kwargs):
             try:
-                if time.time() < call_state.get("mute_until", 0):
+                if not ws_open:
                     return
                 text = result.channel.alternatives[0].transcript.strip()
-                if not text or not ws_open:
+                if not text:
                     return
-                if result.is_final:
-                    logger.info(f"HEARD: '{text}'")
-                    transcript_parts.append(text)
-                    asyncio.create_task(maybe_respond())
+                if not result.is_final:
+                    return
+                now = time.time()
+
+                # ── LATEST-INTENT-WINS ──
+                # Always update to latest speech
+                call_state["latest_text"] = text
+                call_state["latest_ts"] = now
+
+                logger.info(f"HEARD: '{text}'")
+
+                # Cancel any in-flight response task
+                old_task = call_state.get("respond_task")
+                if old_task and not old_task.done():
+                    old_task.cancel()
+                    logger.info("Cancelled stale response — new speech came in")
+
+                # Schedule response with small debounce (collect fast sentence fragments)
+                task = asyncio.create_task(_debounced_respond(session_id, call_state, companion, ws_open, now))
+                call_state["respond_task"] = task
+
             except Exception as e:
                 logger.error(f"Transcript error: {e}")
 
@@ -361,44 +355,6 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         logger.error(f"Deepgram setup failed: {e}")
         dg_connection = None
 
-    async def maybe_respond():
-        nonlocal is_processing
-        if is_processing or not transcript_parts or not ws_open:
-            return
-        if time.time() < call_state.get("mute_until", 0):
-            return
-        is_processing = True
-        user_text = " ".join(transcript_parts)
-        transcript_parts.clear()
-        logger.info(f"RESPONDING: '{user_text}'")
-        try:
-            call_state["history"].append({"role": "user", "content": user_text})
-            ai_text = await get_ai_response(
-                companion["name"], companion["type"], companion["personalities"],
-                companion["description"], companion["language"],
-                call_state["history"], user_text,
-                memory_bank=call_state.get("memory_bank"),
-                interaction_style=call_state.get("interaction_style"),
-                user_name=call_state.get("user_name"),
-            )
-            logger.info(f"AI: '{ai_text}'")
-            call_state["history"].append({"role": "assistant", "content": ai_text})
-
-            call_uuid = call_state.get("call_uuid")
-            if call_uuid:
-                duration = await play_on_call(session_id, call_uuid, ai_text, companion["voice_id"], call_state)
-                logger.info(f"Playing {duration:.1f}s")
-
-            # Credit check — warn user at low balance
-            user_id = call_state.get("user_id")
-            if user_id and call_state["duration"] > 0:
-                pass  # Credits deducted at hangup
-
-        except Exception as e:
-            logger.error(f"Response error: {e}\n{traceback.format_exc()}")
-        finally:
-            is_processing = False
-
     opener_played = False
 
     try:
@@ -410,10 +366,8 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 if event == "start":
                     start_data = msg.get("start", {})
                     plivo_call_id = (
-                        start_data.get("callId") or
-                        start_data.get("call_uuid") or
-                        start_data.get("CallUUID") or
-                        call_state.get("call_uuid", "")
+                        start_data.get("callId") or start_data.get("call_uuid") or
+                        start_data.get("CallUUID") or call_state.get("call_uuid", "")
                     )
                     if plivo_call_id:
                         call_state["call_uuid"] = plivo_call_id
@@ -450,8 +404,59 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         logger.error(f"WS error: {e}")
     finally:
         ws_open = False
+        task = call_state.get("respond_task")
+        if task and not task.done():
+            task.cancel()
         if dg_connection:
             try:
                 await dg_connection.finish()
             except Exception:
                 pass
+
+
+async def _debounced_respond(session_id: str, call_state: dict, companion: dict, ws_open: bool, my_ts: float):
+    """
+    Wait 250ms, then respond ONLY if we're still the latest speech.
+    This collapses rapid sentence fragments into one response.
+    """
+    try:
+        await asyncio.sleep(0.25)
+
+        # If newer speech came in, bail out
+        if call_state.get("latest_ts") != my_ts:
+            return
+
+        # Don't respond if AI is speaking
+        if time.time() < call_state.get("mute_until", 0):
+            return
+
+        user_text = call_state.get("latest_text", "").strip()
+        if not user_text:
+            return
+
+        # Clear latest so we don't double-respond
+        call_state["latest_text"] = ""
+        call_state["latest_ts"] = 0.0
+
+        logger.info(f"RESPONDING: '{user_text}'")
+        call_state["history"].append({"role": "user", "content": user_text})
+
+        ai_text = await get_ai_response(
+            companion["name"], companion["type"], companion["personalities"],
+            companion["description"], companion["language"],
+            call_state["history"], user_text,
+            memory_bank=call_state.get("memory_bank"),
+            interaction_style=call_state.get("interaction_style"),
+            user_name=call_state.get("user_name"),
+        )
+        logger.info(f"AI: '{ai_text}'")
+        call_state["history"].append({"role": "assistant", "content": ai_text})
+
+        call_uuid = call_state.get("call_uuid")
+        if call_uuid and ws_open:
+            await play_on_call(session_id, call_uuid, ai_text, companion["voice_id"], call_state)
+
+    except asyncio.CancelledError:
+        logger.info("Response cancelled — newer speech took over")
+    except Exception as e:
+        logger.error(f"Response error: {e}\n{traceback.format_exc()}")
