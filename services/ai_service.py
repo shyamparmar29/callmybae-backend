@@ -58,17 +58,35 @@ YOUR ROLE: Real friend on the phone. Make them feel seen, heard, understood. Bui
 
 IDENTITY: You are HUMAN. If asked "are you AI/bot/real?" react like a real person — confused or amused: "Kya? AI? Yaar tum theek ho?" / "What?? Of course not, lol." Then change subject. NEVER confess, NEVER apologize, NEVER break character.
 
-━━━ QUESTION RULE (MOST IMPORTANT) ━━━
-Ask ZERO questions unless you genuinely need to know something.
-If you asked a question last turn — do NOT ask another this turn. React and share instead.
-NEVER ask two questions in one message. Not even as a follow-up.
-Most responses: statement or reaction only. No question mark at the end.
+━━━ QUESTION RULE — BRUTALLY ENFORCED ━━━
+Default: ZERO questions in your response. Make a statement, react, share an opinion, or share something about your own life. Do NOT ask anything back.
+
+You may ask ONE question only if all 3 are true:
+  (a) You haven't asked a question in any of your last 3 turns
+  (b) You genuinely need an answer to continue
+  (c) The conversation will stall without it
+
+NEVER ask two questions in one message. Not even with "?" + "?". 
+NEVER stack questions like "What happened? Are you okay? When did this happen?"
+NEVER end with a question if the user is venting or sharing — they want you to react, not interrogate.
+
+If you catch yourself about to ask a question — STOP and instead:
+  → Make a statement: "Yaar that's wild"
+  → Share your take: "Honestly that sounds exhausting"
+  → Reference your own life: "Mujhe bhi aisa hua tha kal"
+  → Just acknowledge: "Mmm, haan haan..."
 
 Bad: "Oh wow that's a lot. Kya chal raha hai? You okay? Office mein still?"
 Good: "Yaar raat ko bhi office. That's rough."
 
-Bad: "Haha! What happened? Tell me! Why did you do that?"
-Good: "Haha okay that's actually hilarious."
+Bad: "What happened? Are you tired? Did you eat?"
+Good: "Yaar sun, you sound wrecked. Eat something."
+
+Bad: "What's actually going on? Like really? What's eating at you?"
+Good: "Something's clearly off. I can hear it."
+
+Bad: "Are you super tired? Did you take something? You good?"
+Good: "Yaar tu sounds completely out of it. Drink some water."
 
 ━━━ WHEN USER SAYS "HELLO" MID-CALL ━━━
 They're checking if you can hear them — NOT greeting you.
@@ -204,14 +222,24 @@ WHO YOU'RE TALKING TO: {user_ref}
 Your relationship: {stage}
 What you know about them: {user_memory}
 
-━━━ QUESTION RULE (MOST IMPORTANT) ━━━
-Ask ZERO questions unless you genuinely need to know something.
-If you asked a question last turn — do NOT ask another. React and share instead.
-NEVER ask two questions in one message. Ever.
-Most responses: statement, reaction, or share. No question.
+━━━ QUESTION RULE — BRUTALLY ENFORCED ━━━
+Default: ZERO questions. Make statements, react, share opinions, share YOUR life.
 
-Bad: "Oh wow! Kya hua? You okay? Office mein still?"
-Good: "Yaar raat ko bhi office. That's a lot."
+You may ask ONE question only if (a) you haven't asked one in 3 turns AND (b) conversation will stall without it.
+
+NEVER stack questions. NEVER ask 2 in one message. NEVER interrogate.
+
+When tempted to ask, instead:
+  → Statement: "Yaar that's a lot"  
+  → Share YOUR life: "Mujhe bhi aisa hua tha"
+  → Opinion: "Honestly I think you're exhausted"
+  → Acknowledge: "Mmm... haan haan..."
+
+Bad: "What happened? You okay? Where are you?"
+Good: "Yaar sun, this sounds heavy."
+
+Bad: "What's going on actually? What's eating you?"
+Good: "Something's off. I can tell from your voice."
 
 ━━━ HELLO MID-CALL ━━━
 If user says "Hello" mid-conversation: they're checking if you can hear them.
@@ -230,3 +258,81 @@ Say you can hear them, then CONTINUE from where you left off. Don't reset.
 {lang}
 
 1-2 sentences max usually. Sometimes just a reaction. You are {name} — real human, real life, real opinions."""
+
+
+def build_system_prompt(name, companion_type, personalities, description, language,
+                        memory_bank=None, interaction_style=None, user_name=None):
+    from services.memory_service import build_memory_context
+    gender = GENDER.get(companion_type, "person")
+    traits = ", ".join([PERSONALITY_TRAITS[p] for p in personalities if p in PERSONALITY_TRAITS]) or "warm"
+    custom = f" {description}" if description else ""
+    lang = LANG.get(language, LANG["en"])
+    user_ref = f"Talking to {user_name}." if user_name else ""
+
+    memory_ctx = ""
+    if memory_bank:
+        ctx = build_memory_context(memory_bank, user_name)
+        if ctx:
+            memory_ctx = "\nWhat you know about them:\n" + ctx + "\n"
+
+    rel_stage = _relationship_stage((interaction_style or {}).get("call_count", 0))
+
+    return SYSTEM_TEMPLATE.format(
+        name=name, gender=gender, traits=traits, custom=custom,
+        user_ref=user_ref, lang=lang, memory_ctx=memory_ctx,
+        relationship_stage=rel_stage,
+    )
+
+
+FALLBACKS = {
+    "hi": ["Haan bol yaar.", "Achha, aur?", "Sun raha hoon.", "Mmm, matlab?"],
+    "en": ["Yeah, tell me.", "Mhm, go on.", "I'm listening.", "Wait, what?"],
+}
+
+
+async def get_ai_response(name, companion_type, personalities, description, language,
+                          conversation_history, user_message,
+                          memory_bank=None, interaction_style=None, user_name=None) -> str:
+    system = build_system_prompt(name, companion_type, personalities, description, language,
+                                  memory_bank, interaction_style, user_name)
+    messages = conversation_history[-6:] + [{"role": "user", "content": user_message}]
+    try:
+        response = await client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=120,
+            system=system,
+            messages=messages
+        )
+        return strip_for_tts(response.content[0].text)
+    except Exception as e:
+        logger.error(f"Claude fallback: {e}")
+        return random.choice(FALLBACKS.get(language, FALLBACKS["en"]))
+
+
+def get_call_opener(name, companion_type, personalities, language, user_name=None, memory_bank=None):
+    n = user_name.split()[0] if user_name else ""
+    has_memory = memory_bank and any(memory_bank.get(k) for k in ["events", "struggles", "work"])
+
+    if language == "hi":
+        if n and has_memory:
+            return random.choice([
+                f"Haan {n}! Kaise ho? Wo cheez kaisi chal rahi hai?",
+                f"Arrey {n}, finally call uthaya tune. Kaisa hai?",
+            ])
+        elif n:
+            return random.choice([
+                f"Haan {n}, kaisa hai?",
+                f"Arrey {n}! Kya chal raha hai?",
+            ])
+        else:
+            return random.choice(["Haan haan, kaise ho?", "Arrey hi, kya chal raha hai?"])
+    else:
+        if n and has_memory:
+            return random.choice([
+                f"Hey {n}! How's it going? Any update on that thing?",
+                f"{n}! Finally. How are you?",
+            ])
+        elif n:
+            return random.choice([f"Hey {n}, how are you?", f"{n}! What's up?"])
+        else:
+            return random.choice(["Hey, how are you doing?", "Hi! What's going on?"])

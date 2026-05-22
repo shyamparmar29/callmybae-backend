@@ -200,7 +200,7 @@ async def plivo_answer(session_id: str, db: AsyncSession = Depends(get_db)):
     ws_url = f"wss://callmybae-backend.onrender.com/api/calls/ws/{session_id}"
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Stream streamTimeout="300" keepCallAlive="true" bidirectional="true" audioTrack="inbound" contentType="audio/x-mulaw;rate=8000" maxDuration="300">
+    <Stream streamTimeout="3600" keepCallAlive="true" bidirectional="true" audioTrack="inbound" contentType="audio/x-mulaw;rate=8000" maxDuration="3600">
         {ws_url}
     </Stream>
 </Response>"""
@@ -395,15 +395,25 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         lang = companion["language"]
         if len(lang) > 5:
             lang = "en"
+        # For Hindi calls, use multi-language model that handles Hinglish better
+        # "multi" supports Hindi+English code-switching naturally
+        if lang == "hi":
+            dg_model = "nova-2-general"
+            dg_lang = "multi"
+        else:
+            dg_model = "nova-2"
+            dg_lang = lang
 
         await dg_connection.start(LiveOptions(
-            model="nova-2",
-            language=lang,
+            model=dg_model,
+            language=dg_lang,
             encoding="mulaw",
             sample_rate=8000,
             punctuate=True,
-            endpointing=150,
+            endpointing=200,  # 200ms = better balance of speed vs catching full thoughts
             interim_results=False,
+            smart_format=True,
+            no_delay=True,
         ))
         try:
             await asyncio.wait_for(dg_ready.wait(), timeout=8.0)
