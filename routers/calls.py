@@ -547,10 +547,10 @@ async def _silence_monitor(call_state: dict, websocket, session_id: str):
             # - AI not currently speaking
             # - No response in flight
             # - At least 12s since last check-in
-            if (silence_duration > 7
+            if (silence_duration > 10
                 and now > mute_until + 0.5
                 and not is_processing
-                and time_since_checkin > 12):
+                and time_since_checkin > 18):
 
                 # After 3 check-ins with no response, stop bothering
                 if consecutive_checkins >= 3:

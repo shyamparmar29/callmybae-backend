@@ -251,8 +251,9 @@ async def advance_character_life(character_name: str, current_life_state: dict, 
 
         result_text = response.content[0].text.strip()
         # Strip markdown if Claude added it
-        result_text = re.sub(r"^```(?:json)?\s*", "", result_text)
-        result_text = re.sub(r"\s*```$", "", result_text)
+        import re as _re
+        result_text = _re.sub(r"^```(?:json)?\s*", "", result_text)
+        result_text = _re.sub(r"\s*```$", "", result_text)
 
         update = json.loads(result_text)
 
@@ -323,8 +324,9 @@ Keep each entry short. Skip if nothing notable was shared."""
             messages=[{"role": "user", "content": prompt}]
         )
         text = response.content[0].text.strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+        import re as _re
+        text = _re.sub(r"^```(?:json)?\s*", "", text)
+        text = _re.sub(r"\s*```$", "", text)
         new_data = json.loads(text)
 
         # Merge into existing memory
