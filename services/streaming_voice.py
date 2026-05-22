@@ -52,7 +52,7 @@ async def stream_response_to_plivo(
         f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input"
         f"?model_id=eleven_flash_v2_5"
         f"&output_format=ulaw_8000"
-        f"&optimize_streaming_latency=3"
+        f"&optimize_streaming_latency=4"
         f"&inactivity_timeout=30"
     )
 
@@ -68,7 +68,7 @@ async def stream_response_to_plivo(
                     "use_speaker_boost": True,
                 },
                 "generation_config": {
-                    "chunk_length_schedule": [50, 90, 120, 150],
+                    "chunk_length_schedule": [50, 80, 110, 150],
                 },
                 "xi_api_key": settings.ELEVENLABS_API_KEY,
             }))
@@ -80,10 +80,17 @@ async def stream_response_to_plivo(
             async def claude_to_elevenlabs():
                 nonlocal full_text
                 try:
+                    # Prompt caching: system prompt cached for 5 mins
+                    # Saves ~200ms on subsequent calls in same conversation
+                    cached_system = [{
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"}
+                    }]
                     async with anthropic_client.messages.stream(
                         model=settings.CLAUDE_MODEL,
-                        max_tokens=120,
-                        system=system_prompt,
+                        max_tokens=100,
+                        system=cached_system,
                         messages=messages,
                     ) as stream:
                         async for token in stream.text_stream:

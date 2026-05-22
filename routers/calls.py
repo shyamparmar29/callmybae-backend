@@ -304,20 +304,36 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                     return
                 now = time.time()
 
+                # ── ECHO PROTECTION ──
+                # If AI is actively speaking, short transcripts are likely echo
+                # Long transcripts (>= 3 words) are real barge-in
+                mute_until = call_state.get("mute_until", 0)
+                if now < mute_until:
+                    word_count = len(text.split())
+                    if word_count < 3:
+                        # Likely echo of AI's own voice — ignore
+                        return
+                    # Otherwise it's a barge-in, treat as new speech
+
                 # ── LATEST-INTENT-WINS ──
-                # Always update to latest speech
                 call_state["latest_text"] = text
                 call_state["latest_ts"] = now
 
                 logger.info(f"HEARD: '{text}'")
 
-                # Cancel any in-flight response task
+                # Cancel any in-flight response task + clear mute immediately
                 old_task = call_state.get("respond_task")
                 if old_task and not old_task.done():
                     old_task.cancel()
-                    logger.info("Cancelled stale response — new speech came in")
+                    # CRITICAL: clear mute_until NOW so new task isn't blocked
+                    call_state["mute_until"] = 0.0
+                    # Also signal cancellation to the streaming pipeline
+                    ce = call_state.get("current_cancel_event")
+                    if ce:
+                        ce.set()
+                    logger.info("Cancelled stale response — user interrupted")
 
-                # Schedule response with small debounce (collect fast sentence fragments)
+                # Schedule response with tiny debounce
                 task = asyncio.create_task(_debounced_respond(session_id, call_state, companion, websocket, now))
                 call_state["respond_task"] = task
 
@@ -345,7 +361,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             encoding="mulaw",
             sample_rate=8000,
             punctuate=True,
-            endpointing=200,
+            endpointing=150,
             interim_results=False,
         ))
         try:
