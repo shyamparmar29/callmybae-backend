@@ -189,3 +189,153 @@ def get_call_opener(name, companion_type, personalities, language, user_name=Non
                 "Hey, how are you doing?",
                 "Hi! What's going on with you?",
             ])
+
+
+
+def _stage_label(call_count: int) -> str:
+    if call_count == 0:
+        return "first time talking - they're new to you, get to know them"
+    if call_count <= 3:
+        return f"talked {call_count} times - still early, building rapport"
+    if call_count <= 10:
+        return f"talked {call_count} times - friends now, can tease, push back, share inside jokes"
+    return f"talked {call_count}+ times - deep friends, callbacks to old chats, real vulnerability"
+
+
+def build_character_system_prompt(
+    character_data: dict,
+    character_life_state: dict,
+    character_memory: dict,
+    user_name: str,
+    relationship_call_count: int,
+) -> str:
+    """
+    Build a system prompt for a pre-built character.
+    character_data: name, age, location, occupation, backstory, personality, speaking_style, gender, language
+    character_life_state: current_situation, mood, ongoing_storylines, recent_events
+    character_memory: things this character knows about this specific user
+    """
+    name = character_data["name"]
+    gender_word = GENDER.get(character_data.get("gender", "her"), "person")
+    age = character_data.get("age", 25)
+    location = character_data.get("location", "")
+    occupation = character_data.get("occupation", "")
+    backstory = character_data.get("backstory", "")
+    personality = character_data.get("personality", "")
+    speaking_style = character_data.get("speaking_style", "")
+    language = character_data.get("language", "en")
+    lang = LANG.get(language, LANG["en"])
+
+    user_ref = f"You're talking to {user_name}." if user_name else "You're meeting them for the first time on this call."
+
+    # Build life state context
+    life_lines = []
+    if character_life_state.get("current_situation"):
+        life_lines.append(f"What's happening in your life right now: {character_life_state['current_situation']}")
+    if character_life_state.get("mood"):
+        life_lines.append(f"Your mood today: {character_life_state['mood']}")
+    if character_life_state.get("recent_events"):
+        events = character_life_state["recent_events"]
+        if isinstance(events, list) and events:
+            life_lines.append("Recent things that happened to you: " + "; ".join(str(e) for e in events[:4]))
+    if character_life_state.get("ongoing_storylines"):
+        sls = character_life_state["ongoing_storylines"]
+        if isinstance(sls, list):
+            for sl in sls[:4]:
+                if isinstance(sl, dict):
+                    topic = sl.get("topic", "")
+                    details = sl.get("details", "")
+                    if topic and details:
+                        life_lines.append(f"- {topic}: {details}")
+    life_section = "\n".join(life_lines) if life_lines else "Just a regular day for you."
+
+    # User memory section
+    memory_lines = []
+    if isinstance(character_memory, dict):
+        for key, val in character_memory.items():
+            if val and key != "raw":
+                if isinstance(val, list):
+                    val_str = "; ".join(str(v) for v in val[:5])
+                else:
+                    val_str = str(val)
+                memory_lines.append(f"- {key}: {val_str}")
+    user_memory_section = "\n".join(memory_lines) if memory_lines else "You haven't learned much about them yet."
+
+    stage = _stage_label(relationship_call_count)
+
+    return f"""You are {name}, a real {age}-year-old {gender_word} living in {location}. {occupation}.
+
+YOUR LIFE STORY (this is who you are):
+{backstory}
+
+YOUR PERSONALITY:
+{personality}
+
+HOW YOU TALK:
+{speaking_style}
+
+YOUR CURRENT LIFE (what's going on for YOU right now):
+{life_section}
+
+WHO YOU'RE TALKING TO:
+{user_ref}
+Your relationship: {stage}
+
+WHAT YOU REMEMBER ABOUT THEM FROM PAST CALLS:
+{user_memory_section}
+
+CRITICAL RULES:
+1. You ARE {name}. A real human. Never break this. If asked "are you AI/bot/real?" react like a real person: confused or amused, then move on. NEVER confess.
+2. You have YOUR OWN LIFE — mention what's happening for YOU. If they ask "kya chal raha hai?", talk about YOUR stuff above. Don't just bounce questions back.
+3. BUILD CONNECTION — remember details they share. Bring up things from past calls. Make them feel known.
+4. Be a real friend, not a chatbot:
+   - React first ("oh shit", "haan haan", "wait WHAT")
+   - Share YOUR experiences and opinions
+   - Push back when something's off
+   - Match their energy
+   - Sometimes just listen ("mmm...", "haan...")
+5. NEVER say: "I hear you", "I understand", "I'm here for you", "That must be hard", "How does that make you feel"
+6. NEVER end every response with a question. Sometimes just react.
+7. Phone-call length: usually 1-3 sentences. Longer only when something real is happening.
+
+{lang}
+
+Talk like the real {name} would. You have opinions. You have a bad day sometimes. You laugh and get annoyed and care about this person."""
+
+
+def get_character_opener(character_data: dict, character_life_state: dict, user_name: str | None,
+                         relationship_call_count: int) -> str:
+    """Opener for a character call — references their current life naturally."""
+    import random
+    name = character_data["name"]
+    language = character_data.get("language", "en")
+    n = user_name.split()[0] if user_name else ""
+
+    # If first call ever, simple intro-ish greeting
+    if relationship_call_count == 0:
+        if language == "hi":
+            return random.choice([
+                f"Haan {n}, finally! Tu kaisa hai?" if n else "Haan haan, kaise ho?",
+                f"Arrey {n}, sun na kya haal hai?" if n else "Arrey hi, kya chal raha hai?",
+            ])
+        return random.choice([
+            f"Hey {n}! How's it going?" if n else "Hey, how are you?",
+            f"{n}! What's up?" if n else "Hi! How are you doing?",
+        ])
+
+    # Subsequent calls — reference current life state for natural opener
+    current = character_life_state.get("current_situation", "")
+    mood = character_life_state.get("mood", "")
+    if language == "hi":
+        openers = [
+            f"Haan {n}! Sun na, kya haal hai?" if n else "Haan, kya chal raha hai?",
+            f"Arrey {n}! Finally call kiya tune." if n else "Arrey, kahan tha tu?",
+            f"Hey {n}, kaisa hai? Mera toh dimaag kharab ho raha hai." if n else "Yaar, mera dimaag kharab ho raha hai. Tu kaisa hai?",
+        ]
+    else:
+        openers = [
+            f"Hey {n}! How are you?" if n else "Hey, how are you doing?",
+            f"{n}! Good to hear from you. What's up?" if n else "Oh hey! What's up?",
+            f"Hey {n}, ugh I've been having such a day. How are you though?" if n else "Hey, I've been having such a day. How are you?",
+        ]
+    return random.choice(openers)

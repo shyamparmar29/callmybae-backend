@@ -10,9 +10,9 @@ from models import Companion, CallSession, User, UserProfile
 from schemas import InitiateCallRequest, InitiateCallResponse, CallStatusResponse
 from auth_utils import get_optional_user
 from services.plivo_service import initiate_outbound_call, build_hangup_xml, start_recording
-from services.ai_service import get_ai_response, get_call_opener
+from services.ai_service import get_ai_response, get_call_opener, build_character_system_prompt, get_character_opener
 from services.voice_service import text_to_speech_mp3, select_voice
-from services.memory_service import extract_memories_from_transcript, merge_memories
+from services.memory_service import extract_memories_from_transcript, merge_memories, advance_character_life, extract_user_memory_for_character
 from services.streaming_voice import stream_response_to_plivo, stream_text_to_plivo, pick_checkin
 from services.ai_service import build_system_prompt
 from routers.credits import get_or_create_credits, deduct_credits_for_call, CREDITS_PER_MINUTE
@@ -182,11 +182,19 @@ async def plivo_answer(session_id: str, db: AsyncSession = Depends(get_db)):
 
     call_state = active_calls.get(session_id, {})
     companion = call_state.get("companion", {})
-    opener = get_call_opener(
-        companion.get("name", "Luna"), companion.get("type", "her"),
-        companion.get("personalities", []), companion.get("language", "en"),
-        user_name=call_state.get("user_name"), memory_bank=call_state.get("memory_bank"),
-    )
+    if call_state.get("is_character_call"):
+        opener = get_character_opener(
+            character_data=call_state.get("character_data", {}),
+            character_life_state=call_state.get("character_life_state", {}),
+            user_name=call_state.get("user_name"),
+            relationship_call_count=call_state.get("relationship_call_count", 0),
+        )
+    else:
+        opener = get_call_opener(
+            companion.get("name", "Luna"), companion.get("type", "her"),
+            companion.get("personalities", []), companion.get("language", "en"),
+            user_name=call_state.get("user_name"), memory_bank=call_state.get("memory_bank"),
+        )
     call_state["opener"] = opener
 
     ws_url = f"wss://callmybae-backend.onrender.com/api/calls/ws/{session_id}"
@@ -237,6 +245,39 @@ async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Dep
                     profile.interaction_style = style
             except Exception as e:
                 logger.error(f"Memory save error: {e}")
+
+        # ── CHARACTER CALL: Advance character\'s life + update user memory ──
+        if user_id and call_state.get("is_character_call") and session.transcript:
+            try:
+                from models import UserCharacterRelationship, Character
+                character_id = call_state.get("character_id")
+                character_name = call_state.get("character_data", {}).get("name", "")
+                current_life = call_state.get("character_life_state", {})
+                current_memory = call_state.get("character_memory", {})
+
+                # 1. Advance character\'s life one step
+                new_life = await advance_character_life(character_name, current_life, session.transcript)
+                # 2. Extract what user shared with this character
+                new_memory = await extract_user_memory_for_character(session.transcript, current_memory)
+
+                # 3. Save to relationship
+                rel_result = await db.execute(
+                    select(UserCharacterRelationship).where(
+                        UserCharacterRelationship.user_id == user_id,
+                        UserCharacterRelationship.character_id == character_id,
+                    )
+                )
+                rel = rel_result.scalar_one_or_none()
+                if rel:
+                    rel.character_life_state = new_life
+                    rel.conversation_memory = new_memory
+                    rel.call_count = (rel.call_count or 0) + 1
+                    rel.total_call_minutes = (rel.total_call_minutes or 0) + session.duration_secs / 60
+                    rel.relationship_depth = min(10, (rel.relationship_depth or 0) + 1)
+                    rel.last_call_at = datetime.now(timezone.utc)
+                logger.info(f"Character {character_name} life advanced + user memory updated")
+            except Exception as e:
+                logger.error(f"Character post-call update error: {e}")
 
         await db.flush()
     for k in [k for k in audio_cache if k.startswith(session_id)]:

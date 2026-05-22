@@ -179,3 +179,176 @@ def build_personality_evolution_context(interaction_style: dict) -> str:
         return ""
     
     return "RELATIONSHIP CONTEXT:\n" + "\n".join(lines)
+
+
+
+# ─────────────────────────────────────────────────────────
+# CHARACTER LIFE PROGRESSION
+# After each call, advance the character's life - sometimes positive, sometimes negative
+# ─────────────────────────────────────────────────────────
+
+CHARACTER_LIFE_PROMPT = """You are analyzing a phone conversation between {character_name} (a fictional character with their own life) and a user.
+
+{character_name}'s current life state:
+{current_life_state}
+
+Conversation transcript:
+{transcript}
+
+Your job: ADVANCE {character_name}'s life by one small step. Real life is messy — sometimes things get better, sometimes worse, sometimes both. Pick natural progression based on their existing storylines.
+
+Output ONLY valid JSON with this structure:
+{{
+  "new_mood": "<one phrase describing their updated mood>",
+  "life_event": "<one sentence describing something that happened to them since last call>",
+  "is_positive": true or false,
+  "storyline_updates": [
+    {{"topic": "<topic>", "status": "<new status>", "details": "<updated details>"}}
+  ],
+  "shared_with_user": "<something they shared about themselves in this call, or empty string>"
+}}
+
+Rules:
+- The life_event should feel real and natural for {character_name}
+- Vary positive/negative roughly 60/40 (not always good news)
+- Update at most 2 storylines
+- Keep details short and human"""
+
+
+async def advance_character_life(character_name: str, current_life_state: dict, transcript: list) -> dict:
+    """
+    After a call, advance the character's life one step.
+    Returns updated life_state dict.
+    """
+    if not transcript:
+        return current_life_state
+
+    try:
+        # Format current state
+        state_str = json.dumps(current_life_state, indent=2, ensure_ascii=False)
+        # Format transcript (last 20 messages max)
+        tx_lines = []
+        for m in transcript[-20:]:
+            role = m.get("role", "")
+            content = m.get("content", "")
+            who = character_name if role == "assistant" else "User"
+            tx_lines.append(f"{who}: {content}")
+        tx_str = "\n".join(tx_lines)
+
+        prompt = CHARACTER_LIFE_PROMPT.format(
+            character_name=character_name,
+            current_life_state=state_str,
+            transcript=tx_str,
+        )
+
+        from config import settings
+        response = await client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=500,
+            system="You analyze conversations and update character life states. Output ONLY valid JSON.",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result_text = response.content[0].text.strip()
+        # Strip markdown if Claude added it
+        result_text = re.sub(r"^```(?:json)?\s*", "", result_text)
+        result_text = re.sub(r"\s*```$", "", result_text)
+
+        update = json.loads(result_text)
+
+        # Apply update to life state
+        new_state = dict(current_life_state)
+
+        if update.get("new_mood"):
+            new_state["mood"] = update["new_mood"]
+
+        if update.get("life_event"):
+            recent = list(new_state.get("recent_events", []))
+            recent.insert(0, update["life_event"])
+            new_state["recent_events"] = recent[:6]  # keep last 6 events
+
+        if update.get("storyline_updates"):
+            existing = {sl.get("topic"): sl for sl in new_state.get("ongoing_storylines", []) if isinstance(sl, dict)}
+            for upd in update["storyline_updates"]:
+                if isinstance(upd, dict) and upd.get("topic"):
+                    existing[upd["topic"]] = upd
+            new_state["ongoing_storylines"] = list(existing.values())[:6]
+
+        new_state["last_updated"] = datetime.now(timezone.utc).isoformat()
+        return new_state
+
+    except Exception as e:
+        logger.error(f"advance_character_life error: {e}")
+        return current_life_state
+
+
+async def extract_user_memory_for_character(transcript: list, existing_memory: dict) -> dict:
+    """
+    Extract what THIS USER shared with THIS CHARACTER specifically.
+    Returns merged memory dict.
+    """
+    if not transcript:
+        return existing_memory
+
+    try:
+        tx_lines = []
+        for m in transcript[-30:]:
+            role = m.get("role", "")
+            content = m.get("content", "")
+            if role == "user":
+                tx_lines.append(f"User: {content}")
+        if not tx_lines:
+            return existing_memory
+        tx_str = "\n".join(tx_lines)
+
+        prompt = f"""Extract what the user shared about themselves in this conversation. Output ONLY valid JSON:
+
+{{
+  "shared_facts": ["<fact 1>", "<fact 2>"],
+  "current_feelings": "<what they were feeling>",
+  "mentioned_people": ["<person 1>"],
+  "things_to_remember": ["<thing 1>", "<thing 2>"]
+}}
+
+Conversation:
+{tx_str}
+
+Keep each entry short. Skip if nothing notable was shared."""
+
+        from config import settings
+        response = await client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=400,
+            system="You extract user information from conversations. Output ONLY valid JSON.",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = response.content[0].text.strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        new_data = json.loads(text)
+
+        # Merge into existing memory
+        merged = dict(existing_memory)
+        for key, val in new_data.items():
+            if not val:
+                continue
+            if isinstance(val, list):
+                existing_list = merged.get(key, [])
+                if not isinstance(existing_list, list):
+                    existing_list = []
+                # Dedup while keeping order
+                seen = set(str(x).lower() for x in existing_list)
+                for item in val:
+                    if str(item).lower() not in seen:
+                        existing_list.append(item)
+                        seen.add(str(item).lower())
+                merged[key] = existing_list[-15:]  # cap
+            else:
+                merged[key] = val
+
+        merged["last_updated"] = datetime.now(timezone.utc).isoformat()
+        return merged
+
+    except Exception as e:
+        logger.error(f"extract_user_memory_for_character error: {e}")
+        return existing_memory
