@@ -534,23 +534,28 @@ async def _silence_monitor(call_state: dict, websocket, session_id: str):
             if not call_state.get("ws_open", True):
                 break
             now = time.time()
-            last_speech = call_state.get("last_speech_ts", now)
             mute_until = call_state.get("mute_until", 0)
+            # Reference point: max of last_speech_ts and end of AI audio
+            # This way silence timer never fires while AI is talking
+            baseline = max(
+                call_state.get("last_speech_ts", now),
+                mute_until,
+            )
             respond_task = call_state.get("respond_task")
             is_processing = respond_task and not respond_task.done()
 
-            silence_duration = now - last_speech
+            silence_duration = now - baseline
             time_since_checkin = now - last_checkin
 
             # Conditions for check-in:
-            # - User silent >7s
-            # - AI not currently speaking
+            # - >12s of true silence (after AI finished + user didn't speak)
+            # - AI not currently speaking (mute_until passed)
             # - No response in flight
-            # - At least 12s since last check-in
-            if (silence_duration > 10
-                and now > mute_until + 0.5
+            # - At least 20s since last check-in
+            if (silence_duration > 12
+                and now > mute_until + 1.0
                 and not is_processing
-                and time_since_checkin > 18):
+                and time_since_checkin > 20):
 
                 # After 3 check-ins with no response, stop bothering
                 if consecutive_checkins >= 3:
@@ -635,6 +640,9 @@ async def _debounced_respond(session_id: str, call_state: dict, companion: dict,
 
         # Refine mute_until based on actual audio duration
         call_state["mute_until"] = time.time() + audio_duration + 0.5
+        # CRITICAL: reset silence timer to AFTER AI finishes speaking
+        # so check-in doesn't fire 1 second after AI's response ends
+        call_state["last_speech_ts"] = time.time() + audio_duration + 0.5
 
         if full_text:
             logger.info(f"AI streamed: '{full_text}' ({audio_duration:.1f}s)")
