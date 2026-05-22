@@ -86,11 +86,11 @@ async def verify_payment(
 
     sub.razorpay_payment_id = body.razorpay_payment_id
     sub.status = "active"
-    sub.started_at = datetime.now(timezone.utc)
-    sub.expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    sub.started_at = datetime.utcnow()
+    sub.expires_at = datetime.utcnow() + timedelta(days=30)
 
     # Upgrade user plan
-    user.plan = body.plan
+    # plan stored in subscriptions table, not on user directly
     await db.flush()
 
     return {"success": True, "plan": body.plan, "expires_at": sub.expires_at}

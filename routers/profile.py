@@ -51,7 +51,7 @@ async def get_profile(user: User = Depends(get_current_user), db: AsyncSession =
             "email": user.email,
             "phone": user.phone,
             "avatar_url": user.avatar_url,
-            "plan": user.plan,
+            "plan": "free",
         },
         "profile": {
             "first_name": profile.first_name,
