@@ -69,7 +69,6 @@ async def stream_response_to_plivo(
     try:
         async with websockets.connect(el_url, max_size=10 * 1024 * 1024) as el_ws:
             # ── INIT ──
-            # chunk_length_schedule: first chunk at 5 chars → near-instant first audio
             await el_ws.send(json.dumps({
                 "text": " ",
                 "voice_settings": {
@@ -84,17 +83,16 @@ async def stream_response_to_plivo(
                 "xi_api_key": settings.ELEVENLABS_API_KEY,
             }))
 
-            # ── STEP 1: SEND FILLER IMMEDIATELY (this is the trick!) ──
-            # The filler hits ElevenLabs in <50ms, audio bytes come back in ~75ms.
-            # User hears something in <200ms total. Feels instant.
+            # ── STEP 1: SEND FILLER IMMEDIATELY (perceived instant response) ──
             if use_filler:
                 filler = _pick_filler(language)
                 await el_ws.send(json.dumps({
                     "text": filler,
                     "try_trigger_generation": True,
                 }))
-                # Track filler as part of response history (so AI doesn't repeat it)
-                full_text = filler
+                # NOTE: filler NOT added to full_text — it's a sound not a word.
+                # full_text stays empty so history only gets Claude's actual words.
+                full_text = ""
 
             send_done = asyncio.Event()
 
