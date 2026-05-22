@@ -13,7 +13,7 @@ from services.plivo_service import initiate_outbound_call, build_hangup_xml, sta
 from services.ai_service import get_ai_response, get_call_opener
 from services.voice_service import text_to_speech_mp3, select_voice
 from services.memory_service import extract_memories_from_transcript, merge_memories
-from services.streaming_voice import stream_response_to_plivo
+from services.streaming_voice import stream_response_to_plivo, stream_text_to_plivo, pick_checkin
 from services.ai_service import build_system_prompt
 from routers.credits import get_or_create_credits, deduct_credits_for_call, CREDITS_PER_MINUTE
 from routers.profile import get_or_create_profile
@@ -374,6 +374,9 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         dg_connection = None
 
     opener_played = False
+    call_state["ws_open"] = True
+    call_state["last_speech_ts"] = time.time()
+    silence_task = asyncio.create_task(_silence_monitor(call_state, websocket, session_id))
 
     try:
         async for raw_msg in websocket.iter_text():
@@ -398,7 +401,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                         call_state["mute_until"] = time.time() + 8.0
                         async def play_opener():
                             try:
-                                from services.streaming_voice import stream_response_to_plivo
+                                from services.streaming_voice import stream_response_to_plivo, stream_text_to_plivo, pick_checkin
                                 # We already have the text — fake a 1-token "response"
                                 # Easier: use ElevenLabs WS directly for static text
                                 import websockets as ws_lib
@@ -462,6 +465,9 @@ async def call_websocket(websocket: WebSocket, session_id: str):
         logger.error(f"WS error: {e}")
     finally:
         ws_open = False
+        call_state["ws_open"] = False
+        if silence_task and not silence_task.done():
+            silence_task.cancel()
         task = call_state.get("respond_task")
         if task and not task.done():
             task.cancel()
@@ -471,6 +477,65 @@ async def call_websocket(websocket: WebSocket, session_id: str):
             except Exception:
                 pass
 
+
+
+
+async def _silence_monitor(call_state: dict, websocket, session_id: str):
+    """
+    If user is silent for >7s while we're not speaking and not processing,
+    AI checks in like a real person: "Hello? You still there?"
+    """
+    last_checkin = 0.0
+    consecutive_checkins = 0
+    try:
+        while True:
+            await asyncio.sleep(2.5)
+            if not call_state.get("ws_open", True):
+                break
+            now = time.time()
+            last_speech = call_state.get("last_speech_ts", now)
+            mute_until = call_state.get("mute_until", 0)
+            respond_task = call_state.get("respond_task")
+            is_processing = respond_task and not respond_task.done()
+
+            silence_duration = now - last_speech
+            time_since_checkin = now - last_checkin
+
+            # Conditions for check-in:
+            # - User silent >7s
+            # - AI not currently speaking
+            # - No response in flight
+            # - At least 12s since last check-in
+            if (silence_duration > 7
+                and now > mute_until + 0.5
+                and not is_processing
+                and time_since_checkin > 12):
+
+                # After 3 check-ins with no response, stop bothering
+                if consecutive_checkins >= 3:
+                    continue
+
+                lang = call_state.get("companion", {}).get("language", "en")
+                voice_id = call_state.get("companion", {}).get("voice_id")
+                checkin = pick_checkin(lang)
+                logger.info(f"SILENCE CHECK-IN: '{checkin}'")
+
+                call_state["mute_until"] = now + 4.0
+                try:
+                    duration = await stream_text_to_plivo(checkin, voice_id, websocket)
+                    call_state["mute_until"] = time.time() + duration + 0.3
+                except Exception as e:
+                    logger.error(f"Check-in error: {e}")
+
+                last_checkin = time.time()
+                consecutive_checkins += 1
+            elif silence_duration < 5:
+                # User is active — reset check-in counter
+                consecutive_checkins = 0
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error(f"Silence monitor error: {e}")
 
 async def _debounced_respond(session_id: str, call_state: dict, companion: dict,
                               websocket, my_ts: float):

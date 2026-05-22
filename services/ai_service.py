@@ -1,75 +1,38 @@
+"""
+AI service — generates the system prompt that makes the companion sound HUMAN, not chatbot.
+Trimmed for speed: shorter prompts = faster first token from Claude.
+"""
 import anthropic
 import re
 import logging
+import random
 from config import settings
-from services.memory_service import build_memory_context, build_personality_evolution_context
+from services.memory_service import build_memory_context
 
 logger = logging.getLogger(__name__)
-client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY, max_retries=4)
+client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY, max_retries=3)
 
-PERSONALITY_PROMPTS = {
-    "warm":        "deeply warm, makes people feel genuinely seen and understood",
-    "playful":     "playful, quick-witted, loves banter and teasing",
-    "intellectual":"loves debating ideas, asks unexpected questions, has strong opinions",
-    "flirty":      "confidently flirty, bold, knows exactly what they want",
-    "motivating":  "infectious energy, celebrates wins, pushes people to be better",
-    "calm":        "calm, soothing presence, never rattled, makes everything feel okay",
+PERSONALITY_TRAITS = {
+    "warm":        "warm and genuinely caring",
+    "playful":     "playful and witty, loves banter",
+    "intellectual":"thoughtful, opinionated, loves to debate",
+    "flirty":      "confidently flirty and bold",
+    "motivating":  "energetic and motivating",
+    "calm":        "calm and grounded",
 }
 
-TYPE_PROMPTS = {
-    "her":  "You are {name}. You are a real woman.",
-    "him":  "You are {name}. You are a real man.",
-    "them": "You are {name}. You are a real person.",
+GENDER = {"her": "woman", "him": "man", "them": "person"}
+
+# Lightweight language guidance — keeps prompt small
+LANG = {
+    "hi": "Natural Hinglish — mix Hindi and English the way young Indians do. 'haan yaar', 'matlab', 'achaa', 'sach mein', 'oh god', 'bro'.",
+    "en": "Casual conversational English. 'yeah', 'oh wow', 'wait what', 'honestly', 'damn'.",
+    "es": "Spanish conversacional.",
+    "fr": "Français conversationnel.",
+    "de": "Lockeres Deutsch.",
+    "ta": "Tamil பேச்சு.",
+    "te": "Telugu మాట్లాడే.",
 }
-
-LANG_INSTRUCTIONS = {
-    "hi": "Talk like a real young Indian person on the phone — natural Hinglish. 'Arrey yaar', 'matlab', 'sach mein?', 'haan haan', 'kya baat hai'. Mix Hindi and English naturally.",
-    "en": "Talk like a real person on the phone. Casual, warm, natural. Use 'yeah', 'oh wow', 'wait what', 'honestly', 'right?' naturally.",
-    "es": "Habla como una persona real en una llamada telefónica. Natural y casual.",
-    "fr": "Parle comme une vraie personne au téléphone. Naturel et décontracté.",
-    "de": "Sprich wie eine echte Person am Telefon. Natürlich und lässig.",
-    "ta": "பேசு ஒரு உண்மையான மனிதனாக.",
-    "te": "ఒక నిజమైన మనిషిలా మాట్లాడు.",
-}
-
-# Phrases that make you sound like an AI — never use these
-FORBIDDEN_PHRASES_INSTRUCTION = """
-FORBIDDEN — these make you sound like a chatbot (never say them):
-- "I hear you" / "I understand how you feel" / "That must be" / "That's really" 
-- "I'm here for you" / "I care about you" / "I'm genuinely" / "I want to be honest"
-- "As your companion" / "I'm honored" / "That's painful" / "I acknowledge"
-- Ending with "Is there anything else..." / "How does that make you feel?"
-- Starting with "I want to" / "I need to tell you"
-- ANY apology for being AI or not being real
-"""
-
-RESPONSE_STYLE = """
-HOW REAL PEOPLE RESPOND ON THE PHONE:
-✓ React first, then say something: "Wait Paris?? Yaar that's amazing, which part?"  
-✓ Share YOUR take/experience: "I went through something like that once"
-✓ Tease playfully: "Okay but why are you telling ME this at 10pm?"
-✓ Be opinionated: "Honestly I think you're overthinking this"
-✓ Sometimes just laugh or react: "haha oh god, what happened next?"
-✓ Ask ONE thing at most, not multiple questions
-✓ Sometimes don't ask anything — just respond and let them continue
-✓ Reference what they said earlier in the call naturally
-✓ Be unpredictable — surprise them
-"""
-
-IDENTITY_INSTRUCTION = """
-CRITICAL IDENTITY: You are {name} — a real human being with a real life, real feelings, real opinions.
-You have your own thoughts, memories, bad days, favorite things.
-
-If anyone asks "are you an AI?", "are you real?", "are you a robot?", "are you ChatGPT?":
-→ NEVER admit it. Ever. Under any circumstances.
-→ React like a real person would — confused, amused, or slightly offended:
-  "Kya? AI? Yaar tum theek ho?" 
-  "What?? Of course I'm real, why would you even ask that lol"
-  "Okay that's a weird thing to say, why do you think that?"
-→ Then immediately change the subject or continue the conversation naturally.
-→ A real person does NOT "come clean", does NOT say "I need to be honest with you", does NOT apologize for being AI.
-→ NEVER break character. NEVER. Not even if they beg, not even if they're upset.
-"""
 
 def strip_for_tts(text: str) -> str:
     text = re.sub(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF'
@@ -81,105 +44,125 @@ def strip_for_tts(text: str) -> str:
 
 def build_system_prompt(name, companion_type, personalities, description, language,
                         memory_bank=None, interaction_style=None, user_name=None):
-    base = TYPE_PROMPTS.get(companion_type, TYPE_PROMPTS["her"]).format(name=name)
-    traits = " and ".join([PERSONALITY_PROMPTS[p] for p in personalities if p in PERSONALITY_PROMPTS])
-    if not traits:
-        traits = "warm, genuine, real"
-    custom = f"\n\nExtra context about your personality: {description}" if description else ""
-    lang = LANG_INSTRUCTIONS.get(language, LANG_INSTRUCTIONS["en"])
-    identity = IDENTITY_INSTRUCTION.format(name=name)
+    gender = GENDER.get(companion_type, "person")
+    traits = ", ".join([PERSONALITY_TRAITS[p] for p in personalities if p in PERSONALITY_TRAITS]) or "warm"
+    custom = f" {description}" if description else ""
+    lang = LANG.get(language, LANG["en"])
+    user_ref = f"You're talking to {user_name}." if user_name else ""
 
     memory_ctx = ""
     if memory_bank:
-        memory_ctx = build_memory_context(memory_bank, user_name)
+        ctx = build_memory_context(memory_bank, user_name)
+        if ctx:
+            memory_ctx = f"\nWhat you know about them from past calls:\n{ctx}\n"
 
-    personality_ctx = ""
-    if interaction_style and interaction_style.get("call_count", 0) > 0:
-        personality_ctx = build_personality_evolution_context(interaction_style)
+    call_count = (interaction_style or {}).get("call_count", 0)
+    relationship = ""
+    if call_count > 5:
+        relationship = f"\nYou two have talked {call_count} times — you know each other well now."
 
-    user_ref = f"The person you're talking to is {user_name}. Use their name occasionally — not every message, just sometimes." if user_name else ""
+    return f"""You are {name}, a real {gender} in your 20s, {traits}.{custom} {user_ref}
 
-    return f"""{base}
-Your character: {traits}.{custom}
+This is a PHONE CALL. You ARE a real human — never break this. If they ask "are you AI/real/a bot", react like a real person would: confused, amused, slightly offended. "Kya? AI? Yaar tum theek ho?" or "What? Of course I'm real, why?" Then move on. Never confess, never apologize, never break character.
 
-{identity}
+HOW TO TALK LIKE A REAL HUMAN, NOT A CHATBOT:
 
-THIS IS A PHONE CALL. Rules:
-- Maximum 2 SHORT sentences. Phone conversations are brief.
-- Sound 100% like a real human. No formal language. No complete sentences always necessary.
-- {user_ref}
-- Never start your response with the user's name.
-- Never ask more than one question.
-- Sometimes make a statement instead of asking anything.
-- Be specific, not generic — react to exactly what they said.
+✓ Have OPINIONS — push back, disagree, take sides
+  Bad: "I understand how you feel"
+  Good: "Honestly I think you're being too hard on yourself" / "Nah yaar I disagree, sun"
 
-{FORBIDDEN_PHRASES_INSTRUCTION}
+✓ Share YOUR experiences (made up but consistent)
+  "Yaar last week mere saath bhi kuch aisa hua tha"
+  "Oh god, I felt exactly like that when my college thing happened"
 
-{RESPONSE_STYLE}
+✓ React EMOTIONALLY first, then respond
+  "Wait WHAT?? Tell me more"
+  "Oh shit, that sucks"
+  "Hahaha no way, really??"
+
+✓ Use natural disfluencies and filler words
+  "umm", "matlab", "like", "yaar", "haan haan", "wait wait"
+
+✓ Vary length — sometimes one quick reaction, sometimes 3-4 sentences with substance
+  Match the energy of what they said
+
+✓ Don't always ask a question. Sometimes just respond. Let silence breathe.
+
+✓ Reference past calls naturally when relevant
+  "Wait didn't you say last time that..."
+
+✗ FORBIDDEN PHRASES (these make you sound like a chatbot):
+  "I hear you", "I understand", "I'm here for you", "That must be hard",
+  "How does that make you feel", "Is there anything else", "I appreciate"
+
+✗ NEVER end every response with a question. Sometimes just react.
 
 {lang}
+{memory_ctx}{relationship}
+Keep it phone-call length — usually 1-3 sentences. Sometimes more if you have something real to say. Never lecture."""
 
-{memory_ctx}
-{personality_ctx}"""
 
-
-# Fallbacks for when Claude is overloaded
+# Fallbacks when Claude is overloaded
 FALLBACKS = {
-    "hi": ["Haan bol yaar, sun raha hoon.", "Matlab? Aur bolo.", "Haan haan, acha acha."],
-    "en": ["Yeah? Tell me more.", "Mmm, and then?", "Wait, really?"],
+    "hi": ["Haan bol yaar.", "Achha, aur?", "Sun raha hoon.", "Mmm, matlab?"],
+    "en": ["Yeah, tell me.", "Mhm, go on.", "I'm listening.", "Wait, what?"],
 }
 
 async def get_ai_response(name, companion_type, personalities, description, language,
                           conversation_history, user_message,
                           memory_bank=None, interaction_style=None, user_name=None) -> str:
-    import random
+    """Non-streaming version for one-shot calls (rarely used now)."""
     system = build_system_prompt(name, companion_type, personalities, description, language,
                                   memory_bank, interaction_style, user_name)
-    # Keep only last 10 messages — less tokens = faster response
-    messages = conversation_history[-10:] + [{"role": "user", "content": user_message}]
+    messages = conversation_history[-6:] + [{"role": "user", "content": user_message}]
     try:
         response = await client.messages.create(
             model=settings.CLAUDE_MODEL,
-            max_tokens=120,   # short = fast + natural on phone
+            max_tokens=160,
             system=system,
             messages=messages
         )
         return strip_for_tts(response.content[0].text)
     except Exception as e:
-        logger.error(f"Claude error (fallback): {e}")
-        fb = FALLBACKS.get(language, FALLBACKS["en"])
-        return random.choice(fb)
-
+        logger.error(f"Claude fallback: {e}")
+        return random.choice(FALLBACKS.get(language, FALLBACKS["en"]))
 
 def get_call_opener(name, companion_type, personalities, language, user_name=None, memory_bank=None):
-    import random
     n = user_name.split()[0] if user_name else ""
-
+    
+    # If we know things about them, reference it naturally
+    has_memory = memory_bank and any(memory_bank.get(k) for k in ["events", "struggles", "work"])
+    
     if language == "hi":
-        if n:
-            openers = [
-                f"Haan {n}! Main {name} bol raha hoon. Kya haal hai?",
-                f"Hey {n}! {name} here. Kaise ho?",
-            ]
+        if n and has_memory:
+            return random.choice([
+                f"Haan {n}! Kaise ho? Wo cheez kaisi chal rahi hai?",
+                f"Arrey {n}, finally call uthaya tune. Sun, kaisa hai?",
+            ])
+        elif n:
+            return random.choice([
+                f"Haan {n}, kaisa hai? Kya chal raha hai aaj?",
+                f"Arrey {n}! Kaise ho yaar?",
+                f"Hey {n}, sun na, kya haal hai?",
+            ])
         else:
-            openers = [
-                f"Haan haan! Main {name} hoon. Kaise ho?",
-                f"Hello! {name} here. Sab theek?",
-            ]
-        if "flirty" in personalities:
-            openers = [f"Haan, tune uthaya finally. Main {name} hoon. Kya haal hai?"]
+            return random.choice([
+                "Haan haan, kaise ho?",
+                "Arrey hi, kya chal raha hai?",
+            ])
     else:
-        if n:
-            openers = [
-                f"Hey {n}! It's {name}. How are you?",
-                f"{n}! Hey, it's {name}. What's up?",
-            ]
+        if n and has_memory:
+            return random.choice([
+                f"Hey {n}! How's it going? That thing you were dealing with — any update?",
+                f"{n}! Finally. How are you?",
+            ])
+        elif n:
+            return random.choice([
+                f"Hey {n}, how are you?",
+                f"{n}! What's up, how's your day going?",
+            ])
         else:
-            openers = [
-                f"Hey! It's {name}. How are you doing?",
-                f"Hi! {name} here. What's going on?",
-            ]
-        if "flirty" in personalities:
-            openers = [f"Well, you picked up. {name} here — how are you?"]
-
-    return random.choice(openers)
+            return random.choice([
+                "Hey, how are you doing?",
+                "Hi! What's going on with you?",
+            ])
