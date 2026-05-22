@@ -1,9 +1,10 @@
 """
 Character endpoints:
-- GET /characters/                 list all
-- GET /characters/{id}             detail
-- GET /characters/{id}/relationship  my history with this character
+- GET /characters/                 list all (public)
+- GET /characters/{id}             detail (public)
+- GET /characters/{id}/relationship  my history with this character (auth)
 - POST /characters/{id}/call       start a call as this character
+                                   (auth: full memory; no auth: free trial once per phone)
 """
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,19 +23,19 @@ from services.character_service import (
 from services.plivo_service import initiate_outbound_call
 from routers.credits import get_or_create_credits, CREDITS_PER_MINUTE
 from routers.profile import get_or_create_profile
-from routers.calls import active_calls, audio_counter
+from routers.calls import active_calls, audio_counter, BYPASS_NUMBERS
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 class CharacterCallRequest(BaseModel):
-    phone: str | None = None  # optional, defaults to user's profile phone
+    phone: str | None = None
 
 
 @router.get("/")
 async def get_all_characters(db: AsyncSession = Depends(get_db)):
-    """Public list of characters — anyone can browse."""
+    """Public list of characters."""
     chars = await list_characters(db)
     return {"characters": [serialize_character(c) for c in chars]}
 
@@ -53,7 +54,6 @@ async def get_my_relationship(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """My state with this character — call count, depth, what they're up to."""
     char = await get_character(character_id, db)
     if not char:
         raise HTTPException(404, "Character not found")
@@ -66,33 +66,62 @@ async def get_my_relationship(
 async def call_character(
     character_id: str,
     body: CharacterCallRequest,
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_optional_user),  # OPTIONAL — allows free trial
     db: AsyncSession = Depends(get_db),
 ):
-    """Initiate a call as a specific character."""
+    """
+    Initiate a character call.
+    - Logged in: full memory, life progression, uses credits
+    - Not logged in: free 5-min trial, one-time per phone, no memory persists
+    """
     char = await get_character(character_id, db)
     if not char:
         raise HTTPException(404, "Character not found")
 
-    # Phone: use body or fall back to user's profile phone
-    profile = await get_or_create_profile(user, db)
-    phone = (body.phone or user.phone or "").replace(" ", "").replace("-", "")
+    # Phone resolution
+    phone = (body.phone or "").replace(" ", "").replace("-", "")
+    if not phone and user and user.phone:
+        phone = user.phone.replace(" ", "").replace("-", "")
     if not phone:
-        raise HTTPException(400, "No phone number — please update your profile")
+        raise HTTPException(400, "Phone number required")
     if not phone.startswith("+"):
         phone = "+91" + phone
 
-    # Credit check
-    credits = await get_or_create_credits(user.id, db)
-    if credits.balance < CREDITS_PER_MINUTE:
-        raise HTTPException(402, "Insufficient credits. Please top up to continue.")
+    is_free_trial = False
+    user_name = None
+    char_life_state = dict(char.initial_life_state or {})
+    char_memory = {}
+    rel_call_count = 0
 
-    # Build the relationship state (lazy create)
-    rel = await get_or_create_relationship(user.id, character_id, db)
+    if user:
+        # ── LOGGED IN: use credits, load relationship for memory ──
+        credits = await get_or_create_credits(user.id, db)
+        if credits.balance < CREDITS_PER_MINUTE and phone not in BYPASS_NUMBERS:
+            raise HTTPException(402, "Insufficient credits. Please top up to continue.")
+        profile = await get_or_create_profile(user, db)
+        user_name = profile.first_name or user.name
+        rel = await get_or_create_relationship(user.id, character_id, db)
+        char_life_state = rel.character_life_state or dict(char.initial_life_state or {})
+        char_memory = rel.conversation_memory or {}
+        rel_call_count = rel.call_count or 0
+    else:
+        # ── FREE TRIAL: one per phone, no memory persists ──
+        prior = await db.execute(
+            select(CallSession).where(
+                CallSession.caller_phone == phone,
+                CallSession.is_free_call == True
+            )
+        )
+        if prior.scalars().first() and phone not in BYPASS_NUMBERS:
+            raise HTTPException(
+                403,
+                "Free trial already used. Sign up to keep talking with full memory!"
+            )
+        is_free_trial = True
 
-    # Create a Companion record for this call (we reuse the existing Call infrastructure)
+    # Create companion record (used by call infrastructure)
     companion = Companion(
-        user_id=user.id,
+        user_id=user.id if user else None,
         name=char.name,
         companion_type=char.gender,
         personalities=char.personalities or [],
@@ -103,18 +132,16 @@ async def call_character(
     db.add(companion)
     await db.flush()
 
-    # Create the call session
     session = CallSession(
         companion_id=companion.id,
         character_id=char.id,
         caller_phone=phone,
-        is_free_call=False,
+        is_free_call=is_free_trial,
         status="initiated",
     )
     db.add(session)
     await db.flush()
 
-    # Store call state — flagged as character call so calls.py loads character context
     active_calls[session.id] = {
         "companion": {
             "name": char.name,
@@ -124,19 +151,18 @@ async def call_character(
             "language": char.language,
             "voice_id": char.voice_id,
         },
-        "user_id": user.id,
-        "user_name": profile.first_name or user.name,
-        "memory_bank": profile.memory_bank or {},
-        "interaction_style": profile.interaction_style or {},
+        "user_id": user.id if user else None,
+        "user_name": user_name,
+        "memory_bank": {},
+        "interaction_style": {},
         "history": [],
         "duration": 0,
-        "is_free": False,
+        "is_free": is_free_trial,
         "call_uuid": None,
         "mute_until": 0.0,
         "latest_text": "",
         "latest_ts": 0.0,
         "respond_task": None,
-        # Character-specific:
         "is_character_call": True,
         "character_id": char.id,
         "character_data": {
@@ -150,9 +176,9 @@ async def call_character(
             "gender": char.gender,
             "language": char.language,
         },
-        "character_life_state": rel.character_life_state or {},
-        "character_memory": rel.conversation_memory or {},
-        "relationship_call_count": rel.call_count or 0,
+        "character_life_state": char_life_state,
+        "character_memory": char_memory,
+        "relationship_call_count": rel_call_count,
     }
     audio_counter[session.id] = 0
 
@@ -171,5 +197,6 @@ async def call_character(
         "character_id": char.id,
         "character_name": char.name,
         "status": session.status,
+        "is_free_trial": is_free_trial,
         "message": f"{char.name} is calling you now!",
     }
