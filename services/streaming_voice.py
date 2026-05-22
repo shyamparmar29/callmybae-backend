@@ -79,7 +79,7 @@ async def stream_response_to_plivo(
                     "use_speaker_boost": True,
                 },
                 "generation_config": {
-                    "chunk_length_schedule": [5, 30, 60, 120],
+                    "chunk_length_schedule": [50, 90, 120, 150],
                 },
                 "xi_api_key": settings.ELEVENLABS_API_KEY,
             }))
@@ -209,7 +209,7 @@ async def stream_text_to_plivo(
                     "stability": 0.35, "similarity_boost": 0.80,
                     "style": 0.40, "use_speaker_boost": True,
                 },
-                "generation_config": {"chunk_length_schedule": [5, 30, 60, 120]},
+                "generation_config": {"chunk_length_schedule": [50, 90, 120, 150]},
                 "xi_api_key": settings.ELEVENLABS_API_KEY,
             }))
             await el_ws.send(json.dumps({"text": text, "try_trigger_generation": True}))
