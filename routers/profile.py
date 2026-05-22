@@ -55,11 +55,11 @@ async def get_profile(user: User = Depends(get_current_user), db: AsyncSession =
         },
         "profile": {
             "first_name": profile.first_name,
-            "age": profile.age,
-            "city": profile.city,
-            "occupation": profile.occupation,
-            "about": profile.about,
-            "interests": profile.interests or [],
+            "age": getattr(profile, "age", None),
+            "city": getattr(profile, "city", None),
+            "occupation": getattr(profile, "occupation", None),
+            "about": getattr(profile, "about", None),
+            "interests": getattr(profile, "interests", None) or [],
             "companion_name": profile.companion_name,
             "companion_type": profile.companion_type,
             "companion_language": profile.companion_language,
@@ -95,16 +95,27 @@ async def update_profile(
     if "first_name" in body and body["first_name"]:
         profile.first_name = body["first_name"]
         user.name = body["first_name"]
+    # These fields may not exist in older DB schemas — stored in memory_bank as fallback
     if "age" in body:
-        profile.age = body.get("age")
+        mb = dict(profile.memory_bank or {})
+        mb.setdefault("personal", {})["age"] = body.get("age")
+        profile.memory_bank = mb
     if "city" in body:
-        profile.city = body.get("city")
+        mb = dict(profile.memory_bank or {})
+        mb.setdefault("personal", {})["city"] = body.get("city")
+        profile.memory_bank = mb
     if "occupation" in body:
-        profile.occupation = body.get("occupation")
+        mb = dict(profile.memory_bank or {})
+        mb.setdefault("personal", {})["occupation"] = body.get("occupation")
+        profile.memory_bank = mb
     if "about" in body:
-        profile.about = body.get("about")
+        mb = dict(profile.memory_bank or {})
+        mb.setdefault("personal", {})["about"] = body.get("about")
+        profile.memory_bank = mb
     if "interests" in body:
-        profile.interests = body.get("interests", [])
+        mb = dict(profile.memory_bank or {})
+        mb["interests"] = body.get("interests", [])
+        profile.memory_bank = mb
 
     # ── Phone — stored on User model ──
     if "phone" in body and body["phone"]:
