@@ -13,6 +13,8 @@ from services.plivo_service import initiate_outbound_call, build_hangup_xml, sta
 from services.ai_service import get_ai_response, get_call_opener
 from services.voice_service import text_to_speech_mp3, select_voice
 from services.memory_service import extract_memories_from_transcript, merge_memories
+from services.streaming_voice import stream_response_to_plivo
+from services.ai_service import build_system_prompt
 from routers.credits import get_or_create_credits, deduct_credits_for_call, CREDITS_PER_MINUTE
 from routers.profile import get_or_create_profile
 from config import settings
@@ -316,7 +318,7 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                     logger.info("Cancelled stale response — new speech came in")
 
                 # Schedule response with small debounce (collect fast sentence fragments)
-                task = asyncio.create_task(_debounced_respond(session_id, call_state, companion, ws_open, now))
+                task = asyncio.create_task(_debounced_respond(session_id, call_state, companion, websocket, now))
                 call_state["respond_task"] = task
 
             except Exception as e:
@@ -376,12 +378,52 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                     if not opener_played:
                         opener_played = True
                         opener_text = call_state.get("opener") or f"Hey, it's {companion['name']}. How are you?"
-                        opener_est = len(opener_text) * 0.07 + 3.0
-                        call_state["mute_until"] = time.time() + opener_est
-                        asyncio.create_task(
-                            play_on_call(session_id, call_state.get("call_uuid", ""),
-                                        opener_text, companion["voice_id"], call_state)
-                        )
+                        # Stream the opener directly via WebSocket for fast first audio
+                        call_state["mute_until"] = time.time() + 8.0
+                        async def play_opener():
+                            try:
+                                from services.streaming_voice import stream_response_to_plivo
+                                # We already have the text — fake a 1-token "response"
+                                # Easier: use ElevenLabs WS directly for static text
+                                import websockets as ws_lib
+                                import base64
+                                voice_id = companion["voice_id"]
+                                el_url = (
+                                    f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input"
+                                    f"?model_id=eleven_flash_v2_5&output_format=ulaw_8000"
+                                    f"&optimize_streaming_latency=3"
+                                )
+                                total_bytes = 0
+                                async with ws_lib.connect(el_url, max_size=10*1024*1024) as el_ws:
+                                    await el_ws.send(json.dumps({
+                                        "text": " ",
+                                        "voice_settings": {"stability": 0.35, "similarity_boost": 0.8, "style": 0.4, "use_speaker_boost": True},
+                                        "xi_api_key": settings.ELEVENLABS_API_KEY,
+                                    }))
+                                    await el_ws.send(json.dumps({"text": opener_text}))
+                                    await el_ws.send(json.dumps({"text": ""}))
+                                    while True:
+                                        try:
+                                            msg = await asyncio.wait_for(el_ws.recv(), timeout=10.0)
+                                        except asyncio.TimeoutError:
+                                            break
+                                        data = json.loads(msg)
+                                        if data.get("audio"):
+                                            try:
+                                                total_bytes += len(base64.b64decode(data["audio"]))
+                                            except Exception:
+                                                pass
+                                            await websocket.send_text(json.dumps({
+                                                "event": "playAudio",
+                                                "media": {"contentType": "audio/x-mulaw", "sampleRate": 8000, "payload": data["audio"]}
+                                            }))
+                                        if data.get("isFinal"):
+                                            break
+                                duration = total_bytes / 8000.0
+                                call_state["mute_until"] = time.time() + duration + 0.5
+                            except Exception as e:
+                                logger.error(f"Opener stream error: {e}")
+                        asyncio.create_task(play_opener())
 
                 elif event == "media":
                     payload = msg.get("media", {}).get("payload", "")
@@ -414,19 +456,20 @@ async def call_websocket(websocket: WebSocket, session_id: str):
                 pass
 
 
-async def _debounced_respond(session_id: str, call_state: dict, companion: dict, ws_open: bool, my_ts: float):
+async def _debounced_respond(session_id: str, call_state: dict, companion: dict,
+                              websocket, my_ts: float):
     """
-    Wait 250ms, then respond ONLY if we're still the latest speech.
-    This collapses rapid sentence fragments into one response.
+    Real-time streaming response.
+    Claude tokens → ElevenLabs WebSocket → Plivo WebSocket
+    Target latency: ~600ms time-to-first-audio
     """
     try:
-        await asyncio.sleep(0.25)
+        # Tiny debounce — collapses rapid sentence fragments
+        await asyncio.sleep(0.15)
 
-        # If newer speech came in, bail out
+        # If newer speech arrived, abort
         if call_state.get("latest_ts") != my_ts:
             return
-
-        # Don't respond if AI is speaking
         if time.time() < call_state.get("mute_until", 0):
             return
 
@@ -434,29 +477,54 @@ async def _debounced_respond(session_id: str, call_state: dict, companion: dict,
         if not user_text:
             return
 
-        # Clear latest so we don't double-respond
+        # Lock latest so we don't double-respond
         call_state["latest_text"] = ""
         call_state["latest_ts"] = 0.0
 
-        logger.info(f"RESPONDING: '{user_text}'")
+        logger.info(f"RESPONDING (streaming): '{user_text}'")
         call_state["history"].append({"role": "user", "content": user_text})
 
-        ai_text = await get_ai_response(
+        # Build system prompt with memory
+        system_prompt = build_system_prompt(
             companion["name"], companion["type"], companion["personalities"],
             companion["description"], companion["language"],
-            call_state["history"], user_text,
             memory_bank=call_state.get("memory_bank"),
             interaction_style=call_state.get("interaction_style"),
             user_name=call_state.get("user_name"),
         )
-        logger.info(f"AI: '{ai_text}'")
-        call_state["history"].append({"role": "assistant", "content": ai_text})
+        # Last 10 messages only — less tokens = faster
+        messages = call_state["history"][-10:]
 
-        call_uuid = call_state.get("call_uuid")
-        if call_uuid and ws_open:
-            await play_on_call(session_id, call_uuid, ai_text, companion["voice_id"], call_state)
+        # Create cancellation event tied to this response
+        cancel_event = asyncio.Event()
+        call_state["current_cancel_event"] = cancel_event
+
+        # Pre-mute Deepgram (will refine after we know actual duration)
+        call_state["mute_until"] = time.time() + 20.0  # generous initial mute
+
+        # ── STREAM THE PIPELINE ──
+        full_text, audio_duration = await stream_response_to_plivo(
+            voice_id=companion["voice_id"],
+            system_prompt=system_prompt,
+            messages=messages,
+            plivo_ws=websocket,
+            cancel_event=cancel_event,
+        )
+
+        # Refine mute_until based on actual audio duration
+        call_state["mute_until"] = time.time() + audio_duration + 0.5
+
+        if full_text:
+            logger.info(f"AI streamed: '{full_text}' ({audio_duration:.1f}s)")
+            call_state["history"].append({"role": "assistant", "content": full_text})
 
     except asyncio.CancelledError:
-        logger.info("Response cancelled — newer speech took over")
+        logger.info("Streaming response cancelled — user interrupted")
+        # Cancel the inner pipeline too
+        ce = call_state.get("current_cancel_event")
+        if ce:
+            ce.set()
+        call_state["mute_until"] = 0.0  # allow user speech immediately
     except Exception as e:
-        logger.error(f"Response error: {e}\n{traceback.format_exc()}")
+        logger.error(f"Streaming response error: {e}\n{traceback.format_exc()}")
+        call_state["mute_until"] = 0.0
