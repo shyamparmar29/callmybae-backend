@@ -213,7 +213,7 @@ async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Dep
     session = result.scalar_one_or_none()
     if session:
         session.status = "ended"
-        session.ended_at = datetime.now(timezone.utc)
+        session.ended_at = datetime.utcnow()
         call_state = active_calls.pop(session_id, {})
         # Cancel any pending response task
         task = call_state.get("respond_task")
@@ -239,7 +239,7 @@ async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Dep
                     if new_memories:
                         profile.memory_bank = merge_memories(profile.memory_bank or {}, new_memories)
                     profile.total_call_minutes = (profile.total_call_minutes or 0) + session.duration_secs / 60
-                    profile.last_call_at = datetime.now(timezone.utc)
+                    profile.last_call_at = datetime.utcnow()
                     style = profile.interaction_style or {}
                     style["call_count"] = style.get("call_count", 0) + 1
                     profile.interaction_style = style
@@ -274,7 +274,7 @@ async def plivo_hangup(session_id: str, request: Request, db: AsyncSession = Dep
                     rel.call_count = (rel.call_count or 0) + 1
                     rel.total_call_minutes = (rel.total_call_minutes or 0) + session.duration_secs / 60
                     rel.relationship_depth = min(10, (rel.relationship_depth or 0) + 1)
-                    rel.last_call_at = datetime.now(timezone.utc)
+                    rel.last_call_at = datetime.utcnow()
                 logger.info(f"Character {character_name} life advanced + user memory updated")
             except Exception as e:
                 logger.error(f"Character post-call update error: {e}")

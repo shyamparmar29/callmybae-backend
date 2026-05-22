@@ -16,19 +16,30 @@ logger = logging.getLogger(__name__)
 
 async def seed_characters_if_needed(db: AsyncSession):
     """Insert characters from seed data if they don't exist yet. Idempotent."""
+    from datetime import datetime
     try:
         result = await db.execute(select(Character.id))
         existing_ids = {row[0] for row in result.all()}
 
+        added = 0
         for char_data in SEED_CHARACTERS:
             if char_data["id"] in existing_ids:
                 continue
-            char = Character(**char_data)
+            # Use naive UTC to match TIMESTAMP WITHOUT TIME ZONE column
+            data = dict(char_data)
+            data["created_at"] = datetime.utcnow()
+            char = Character(**data)
             db.add(char)
-        await db.flush()
-        logger.info(f"Character seed complete. Total characters: {len(SEED_CHARACTERS)}")
+            added += 1
+
+        if added:
+            await db.flush()
+            logger.info(f"Seeded {added} characters")
+        else:
+            logger.info(f"Characters already seeded ({len(existing_ids)} found)")
     except Exception as e:
         logger.error(f"Character seeding error: {e}")
+        raise
 
 
 async def list_characters(db: AsyncSession) -> list[Character]:

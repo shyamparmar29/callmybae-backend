@@ -35,7 +35,7 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     db.add(user)
     await db.flush()
     token = create_access_token(user.id)
-    return TokenResponse(access_token=token, user_id=user.id, name=user.name, plan=user.plan)
+    return TokenResponse(access_token=token, user_id=user.id, name=user.name, plan="free")
 
 # ── LOGIN ──
 @router.post("/login", response_model=TokenResponse)
@@ -52,7 +52,7 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     if not user or not user.password_hash or not verify_password(body.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
     token = create_access_token(user.id)
-    return TokenResponse(access_token=token, user_id=user.id, name=user.name, plan=user.plan)
+    return TokenResponse(access_token=token, user_id=user.id, name=user.name, plan="free")
 
 # ── ME ──
 @router.get("/me")
@@ -62,7 +62,7 @@ async def me(user: User = Depends(get_current_user)):
         "name": user.name,
         "email": user.email,
         "phone": user.phone,
-        "plan": user.plan,
+        "plan": "free",
         "avatar_url": user.avatar_url,
     }
 
@@ -142,4 +142,4 @@ async def google_callback(body: dict, db: AsyncSession = Depends(get_db)):
             user.avatar_url = avatar
 
     token = create_access_token(user.id)
-    return TokenResponse(access_token=token, user_id=user.id, name=user.name, plan=user.plan)
+    return TokenResponse(access_token=token, user_id=user.id, name=user.name, plan="free")

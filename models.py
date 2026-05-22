@@ -14,7 +14,7 @@ def _uuid():
 
 
 def _utcnow():
-    return datetime.now(timezone.utc)
+    return datetime.utcnow()  # naive UTC — matches TIMESTAMP WITHOUT TIME ZONE in Postgres
 
 
 class User(Base):
